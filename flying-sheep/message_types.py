@@ -7,6 +7,7 @@ import math
 import hashlib
 import array
 import bisect
+from datetime import datetime  # timezone
 import sys, os, socket
 import requests
 import asyncio
@@ -19,8 +20,9 @@ from bt_utils import HASH_DIGEST_SIZE
 DEFAULT_BLOCK_LENGTH = 2**14
 MAX_PEERS = 50
 MAX_BLOCK_SIZE = b'\x04\x00\x00\x00' # 2**14 == 16384
-NUMWANT = 10  # connection to tracker param
+NUMWANT = 10  # GET parameter to tracker
 BUFFER_SIZE = 5
+CHANNEL_TIMEOUT = datetime.timedelta(seconds=90)
 #HANDSHAKE_ID = 100
 #KEEPALIVE_ID = 200
 
@@ -339,7 +341,7 @@ class Client(object):
         self.channel_state = None
         self.piece_to_peers = defaultdict(set)
         self.peer_to_pieces = defaultdict(set)
-        self.timers = {ip: delta_time for ip in self.active_peers}
+        self.timer = datetime.utcnow()
 
         
     def connect_to_tracker(self, port, numwant=NUMWANT):
@@ -741,6 +743,8 @@ class Client(object):
                         received in state {}".format(self.channel_state[ip].state))
                     # set peer_id of peer
                     peer.peer_id = msgd['peer_id']
+                    # reset peer timer
+                    peer.timer = datetime.utcnow()
                     ident = HANDSHAKE_ID  # identifies handshake
                     return ident
 
@@ -755,6 +759,7 @@ class Client(object):
                 raise ConnectionError("Choke: bad length  received: {} expected: 1"\
                                       .format(length))
             else:
+                peer.timer = datetime.utcnow()
                 self.bt_state[ip].choked = 1  # peer choked client
                 if self.channel_state[ip].state == 30:
                     self.channel_state[ip].state = 3
@@ -774,6 +779,7 @@ class Client(object):
                 raise ConnectionError("Unchoke: bad length  received: {} expected: 1"\
                                       .format(length))
             else:
+                peer.timer = datetime.utcnow()
                 self.bt_state[ip].choked = 0  # peer unchoked client
                 if self.channel_state[ip].state == 3:
                     self.channel_state[ip].state = 30
@@ -790,6 +796,7 @@ class Client(object):
                 raise ConnectionError("Interested: bad length  received: {} expected: 1"\
                                       .format(length))
             else:
+                peer.timer = datetime.utcnow()
                 peer.bt_state.interested = 1  # peer is interested in client
         elif ident == 3:
             #  not interested message
@@ -800,6 +807,7 @@ class Client(object):
                 raise ConnectionError("Not Interested: bad length  received: {} expected: 1"\
                                       .format(length))
             else:
+                peer.timer = datetime.utcnow()
                 peer.bt_state.interested = 0  # peer is not interested in client
         elif ident == 4:
             #  have message
@@ -808,6 +816,7 @@ class Client(object):
             except AssertionError:
                 raise ProtocolError("cannot receive Have msg in state 1")
             else:
+                peer.timer = datetime.utcnow()
                 msgd = self.rcv_have_msg(ip, buf)
                 if self.channel_state[ip].state == 4:
                     self.channel_state[ip].state = 3   
@@ -820,23 +829,29 @@ class Client(object):
                     'Bitfield received in state {}. Did not follow Handshake.'\
                      .format(self.channel_state[ip].state))
             else:
+                peer.timer = datetime.utcnow()
                 msgd = self.rcv_bitfield_msg(ip, buf)  # set peer's bitfield
                 self.channel_state[ip].state = 4
         elif ident == 6:
             #  request message
+            peer.timer = datetime.utcnow()
             pass
         elif ident == 7:
             #  piece message
+            peer.timer = datetime.utcnow()
             rcv_piece_msg(msg)
             pass
         elif ident == 8:
             #  cancel message
+            peer.timer = datetime.utcnow()
             pass
         elif ident == 9:
             #  port message
+            peer.timer = datetime.utcnow()
             pass
         elif ident == 20:
             # extension
+            peer.timer = datetime.utcnow()
             print('extensions not supported')
         else:
             # error
@@ -889,7 +904,6 @@ class Client(object):
             elif self.channel_state[ip] < 7 or self.channel_state[ip] == 30:
                 raise ProtocolError("Cancel received in an invalid state {}".format(self.channel_state[ip].state))
 
-
     @asyncio.coroutine    
     def controller(self):
         for index, ip in self._get_next_piece():
@@ -912,11 +926,13 @@ class Client(object):
             
 
     @asyncio.coroutine
-    def _read_msg(self, reader, ip):
+    def _read_msg(self, peer):
         """
         reader: StreamReader instance for this connection
         output: a discreet msg received from peer
         """
+        ip, _ = peer.address
+        reader = peer.reader
         while True:
             try:
                 msg_length = yield from reader.readexactly(4)
@@ -928,6 +944,7 @@ class Client(object):
                 raise e
             else:
                 if msg_length == KEEPALIVE:
+                    peer.timer = datetime.utcnow()
                     print('received Keep-Alive from peer {}'.format(ip))
                     return KEEPALIVE
                 msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
@@ -969,7 +986,7 @@ class Client(object):
             else:
                 while True:
                     try:
-                        msg = yield from self._read_msg(peer.reader, ip)
+                        msg = yield from self._read_msg(peer)
                     except ConnectionResetError as e:
                         print(e)
                         self._close_peer_connection(peer)
@@ -1002,6 +1019,7 @@ class Peer(object):
         self.reader = None
         self.writer = None
         self.bt_state = BTState()
+        self.timer = datetime.utcnow()
 
 
 ########## 
