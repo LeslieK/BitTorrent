@@ -99,7 +99,7 @@ class Piece_Buffer(object):
         self.torrent = torrent
         self.buffer ={row: array.array('B', bytearray(self.torrent.torrent['info']['piece length'])) for row in range(BUFFER_SIZE)}
         self.free_rows = {i for i in range(BUFFER_SIZE)}
-        self.piece_info = {}
+        self.piece_info = {}  # {row:5, 'all_bytes_received': False, 'hash_verifies': False, 'bitfield': 1111100000, 'offset': 0x8000}
         self.completed_pieces = set()  # set of completed pieces (indices); store as a client attribute?
 
 
@@ -173,7 +173,8 @@ class Piece_Buffer(object):
             self.piece_info[piece_index] = {'row': row,
                                             'all_bytes_received': False,
                                             'hash_verifies': False,
-                                            'bitfield': self._init_bitfield()
+                                            'bitfield': self._init_bitfield(),
+                                            'offset': 0
                                            }
         except KeyError:
             print("Buffer is full")
@@ -610,7 +611,7 @@ class Client(object):
             piece_index, cnt = freq_of_pieces[-1]
             # the choice of the ip can be random.choice(list(range(cnt)))         
             ip = self.piece_to_peers[piece_index][0]  # returns (piece_index, ip)
-            yield piece_index, ip
+            return piece_index, ip
 
     def _filter_on_not_complete():
             return {pindex: ips for pindex, ips in self.piece_to_peers.items() 
@@ -689,18 +690,19 @@ class Client(object):
             self.num_bytes_downloaded += len(block)
             self.num_bytes_left -= self.num_bytes_downloaded
             self.update_bitfield([index])
-            # update data structures that store piece:{ips} and peer:{pieces}
+            # update data structures: piece:{ips} and ip:{pieces}
             self._remove_index_piece_peer_maps(index) 
             # make/send have msg for this piece; send to ips that don't have it
-            pass
+            self.buffer.piece_info[index]['offset'] = 0
         elif buffer.is_piece_complete(index):
             # all bytes received and hash doesn't verify
             self.buffer.reset(index)
             # make/send request msg for this piece
-            pass
+            self.buffer.piece_info[index]['offset'] = 0
         else:
             # not all bytes received
-            pass
+            # return next begin
+            self.buffer.piece_info[index]['offset'] = begin + length
 
     def process_read_msg(self, peer, msg):
         """process incoming msg from peer - protocol state machine
@@ -839,7 +841,7 @@ class Client(object):
         elif ident == 7:
             #  piece message
             peer.timer = datetime.utcnow()
-            rcv_piece_msg(msg)
+            self.rcv_piece_msg(msg)
             pass
         elif ident == 8:
             #  cancel message
@@ -906,54 +908,66 @@ class Client(object):
 
     @asyncio.coroutine    
     def controller(self):
-        for index, ip in self._get_next_piece():
-            peer = self.active_peers[ip]
-            peer.writer.write(INTERESTED)
-            self.process_write_msg(peer, bt_messages_by_name['Interested'])
-            try:
-                msg = yield from self._read_msg(peer.reader, ip)
-            except Exception as e:
-                print(e)
-                self._close_peer_connection(peer)
-                continue
-            else:
-                # process read msg
-                try:
-                    msg_ident = self.process_read_msg(peer, msg)
-                    if msg_ident is KEEPALIVE:
-                        # reset timer
-                        pass
-            
+        """this is written as a separate task across all peers"""
 
-    @asyncio.coroutine
-    def _read_msg(self, peer):
-        """
-        reader: StreamReader instance for this connection
-        output: a discreet msg received from peer
-        """
-        ip, _ = peer.address
-        reader = peer.reader
-        while True:
-            try:
-                msg_length = yield from reader.readexactly(4)
-            except ConnectionResetError as e:
-                print(e)
-                raise ConnectionError
-            except Exception as e:
-                print(e)
-                raise e
-            else:
-                if msg_length == KEEPALIVE:
-                    peer.timer = datetime.utcnow()
-                    print('received Keep-Alive from peer {}'.format(ip))
-                    return KEEPALIVE
-                msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
-                msg_ident = msg_body[0]
-            if msg_ident in list(range(10)):
-                return msg_length + msg_body
-            else:
-                # msg_ident not supported
-                continue
+        # start the piece process:
+        # interested --> request --> process blocks received
+        while piece_to_peers:
+            # select a piece_index and a peer
+            index, ip  = self._get_next_piece()
+            peer = self.active_peers[ip]
+
+            if self.channel_state[ip].open and not self.bt_state[ip].interested:
+                # write Interested
+                peer.writer.write(INTERESTED)
+                self.process_write_msg(peer, bt_messages_by_name['Interested'])
+
+            # if Choked, Read Unchoked
+            if self.channel_state[ip].open and self.bt_state[ip].choked:
+                yield from self.read_peer(peer)           
+
+            # write Request
+            if self.channel_state[ip].open and not self.bt_state[ip].choked:
+                if index not in self.buffer.completed_pieces:
+                    peer.writer.write(make_request(index, self.buffer.piece_info[index]['offset']))
+                    self.process_write_msg(peer, bt_messages_by_name['Request'])
+                
+            # read Piece
+            if self.channel_state[ip].open and not self.bt_state[ip].choked:
+                yield from self.read_peer(peer)
+
+        # all pieces received
+        return 
+
+    #@asyncio.coroutine
+    #def _read_msg(self, peer):
+    #    """
+    #    reader: StreamReader instance for this connection
+    #    output: a discreet msg received from peer
+    #    """
+    #    ip, _ = peer.address
+    #    reader = peer.reader
+    #    while True:
+    #        try:
+    #            msg_length = yield from reader.readexactly(4)
+    #        except ConnectionResetError as e:
+    #            print(e)
+    #            raise ConnectionError
+    #        except Exception as e:
+    #            print(e)
+    #            raise e
+    #        else:
+    #            if msg_length == KEEPALIVE:
+    #                peer.timer = datetime.utcnow()
+    #                print('received Keep-Alive from peer {}'.format(ip))
+    #                return KEEPALIVE
+    #            msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
+    #            msg_ident = msg_body[0]
+    #        if msg_ident in list(range(10)):
+    #            return msg_length + msg_body
+    #        else:
+    #            # msg_ident not supported
+    #            continue
     
     @asyncio.coroutine
     def connect_to_peer(self, peer):
@@ -974,41 +988,62 @@ class Client(object):
             self._open_peer_connection(peer, reader, writer)
             print('wrote Handshake to peer {} channel state: {}'\
                 .format(ip, self.channel_state[ip].state))
-            try:
-                msg_hs = yield from peer.reader.readexactly(68)      # read handshake msg
-                msg_ident = self.process_read_msg(peer, msg_hs)
-                print('received Handshake from peer {} channel state: {}'\
-                    .format(ip, self.channel_state[ip].state))
-            except (ConnectionError, ProtocolError, ConnectionResetError) as e:
-                print(e)
-                self._close_peer_connection(peer)
-                return
+                
+     
+    @asyncio.coroutine
+    def read_handshake(self, peer):
+        try:
+            # read Handshake from peer
+            msg_hs = yield from peer.reader.readexactly(68)      # read handshake msg
+            msg_ident = self.process_read_msg(peer, msg_hs)
+        except (ConnectionError, ProtocolError, ConnectionResetError) as e:
+            print(e)
+            self._close_peer_connection(peer)
+        else:
+            # received Handshake from peer
+            print('received Handshake from peer {} channel state: {}'\
+                .format(ip, self.channel_state[ip].state))
+                             
+    @asyncio.coroutine
+    def read_peer(self, peer):
+        """
+        reads msg from peer and processes it
+        """
+        ip, _ = peer.address
+        reader = peer.reader
+
+        while True:
+            if peer.channel_state[ip].open and self.channel_state[ip].state == 1:
+                try:
+                    msg = yield from self.read_handshake(peer)
+                except Exception as e:
+                    print(e)
+                    sys.exit(-1)
+                else:
+                    print('Received Handshake from {}'.format(ip))
             else:
-                while True:
-                    try:
-                        msg = yield from self._read_msg(peer)
-                    except ConnectionResetError as e:
-                        print(e)
-                        self._close_peer_connection(peer)
-                        return
+                try:
+                    msg_length = yield from reader.readexactly(4)
+                except ConnectionResetError as e:
+                    print(e)
+                    raise ConnectionError
+                except Exception as e:
+                    print(e)
+                    raise e
+                else:
+                    if msg_length == KEEPALIVE:
+                        peer.timer = datetime.utcnow()
+                        print('received Keep-Alive from peer {}'.format(ip))
+                        msg_ident = KEEPALIVE_ID
                     else:
-                        try:
-                            # process input msg
-                            if msg is not KEEPALIVE:
-                                msg_ident = self.process_read_msg(peer, msg)
-                        except ProtocolError as e:
-                            print(e)
-                            self._close_peer_connection(peer)
-                            return
-                        else:
-                            print('received {} from peer {} channel state: {}'\
-                                  .format(bt_messages[msg_ident], 
-                                  ip, self.channel_state[ip].state))
-                            # return control to client
-                            yield
-
-                            
-
+                        msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
+                        msg_ident = msg_body[0]
+                    if msg_ident in list(range(10)) + [KEEPALIVE_ID]:
+                        self.process_read_msg(peer, msg_length + msg_body)
+                        print('received {} from peer {}'.format(bt_messages[msg_ident]))
+                    else:
+                        # msg_ident not supported
+                        continue
 
 class Peer(object):
     def __init__(self, torrent, address):
@@ -1019,7 +1054,7 @@ class Peer(object):
         self.reader = None
         self.writer = None
         self.bt_state = BTState()
-        self.timer = datetime.utcnow()
+        self._timer = datetime.utcnow()
 
 
 ########## 
@@ -1032,7 +1067,7 @@ if __name__ == "__main__":
     # print(torrent_obj.list_of_file_boundaries())
 
     loop = asyncio.get_event_loop()
-    tasks = [client.connect_to_peer(peer) for peer in client.active_peers.values()]
+    tasks = [client.connect_to_peer(peer) for peer in client.active_peers.values()] + [client.controller()]
     loop.run_until_complete(asyncio.wait(tasks))
     #for peer in client.active_peers.values():
     #    loop.run_until_complete(client.connect_to_peer(peer))   
