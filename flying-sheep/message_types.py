@@ -23,7 +23,7 @@ logging.basicConfig(filename="bittorrent.log", filemode='w', level=logging.DEBUG
 DEFAULT_BLOCK_LENGTH = 2**14
 MAX_PEERS = 50
 MAX_BLOCK_SIZE = b'\x04\x00\x00\x00' # 2**14 == 16384
-NUMWANT = 10  # GET parameter to tracker
+NUMWANT = 30  # GET parameter to tracker
 BUFFER_SIZE = 5
 CHANNEL_TIMEOUT = datetime.timedelta(seconds=90)
 HANDSHAKE_ID = 100
@@ -623,9 +623,8 @@ class Client(object):
                 # no pieces left
                 return
             # choose least frequent piece
-            piece_index, cnt = freq_of_pieces[-1]
-            # the choice of the ip can be random.choice(list(range(cnt)))         
-            ip = self.piece_to_peers[piece_index][0]  # returns (piece_index, ip)
+            piece_index, _ = freq_of_pieces[-1]                   
+            ip = self.piece_to_peers[piece_index].pop()  # returns (piece_index, ip)
             return piece_index, ip
 
     def _filter_on_not_complete():
@@ -921,6 +920,9 @@ class Client(object):
                 pass
             elif self.channel_state[ip] < 7 or self.channel_state[ip] == 30:
                 raise ProtocolError("Cancel received in an invalid state {}".format(self.channel_state[ip].state))
+        else:
+            print("Client wrote Unknown message ident: {}".format(ident))
+            raise ProtocolError("Client wrote Unknown message ident: {}".format(ident))
 
     @asyncio.coroutine    
     def downloader(self):
@@ -940,12 +942,15 @@ class Client(object):
                             logging.debug("downloader: {}: error in reading {}".format(ip, msg_ident))
                             self._close_peer_connection(peer)
                             sys.exit(-5)
+                        except ConnectionResetError as e:
+                            print(e)
+                            self._close_peer_connection(peer)
                         else:
                             logging.debug("{}: successfully read {}".format(ip, bt_messages[msg_ident]))
                             print("{}: successfully read {}".format(ip, bt_messages[msg_ident]))
                 #if self.tracker_timer - datetime.datetime.utcnow() > self.tracker_request_interval:
                 #    self.connect_to_tracker(PORTS[1])  # how to connect_to_peer (the new peers?)
-                yield from asyncio.sleep(.1)
+                yield from asyncio.sleep(.001)
             
             # start the piece process:
             # interested --> request --> process blocks received
@@ -959,11 +964,17 @@ class Client(object):
                 peer.writer.write(INTERESTED)
                 self.process_write_msg(peer, bt_messages_by_name['Interested'])
                 logging.debug("{}: wrote INTERESTED".format(ip))
+                print("{}: wrote INTERESTED".format(ip))
 
             # if Choked, Read Unchoked
             if self.channel_state[ip].open and self.bt_state[ip].choked:
                 try:
+                    logging.info("{}: client ready to receive Unchoke".format(ip))
+                    print("{}: client ready to receive Unchoke".format(ip))
                     msg_ident = yield from self.read_peer(peer) # read and process
+                    while bt_messages[msg_ident] != 'Choke':
+                        msg_ident = yield from self.read_peer(peer)
+                    logging.debug("Client received Unchoke from {}".format(ip))
                 except (ProtocolError, ConnectionError) as e:
                     logging.debug("{}: error in reading; expected Unchoke".format(ip))
                     self._close_peer_connection(peer)
@@ -985,9 +996,24 @@ class Client(object):
                             print(e)
                             self._close_peer_connection(peer)
                             sys.exit(-5)
+                        except ConnectionResetError as e:
+                            print(e)
+                            logging.debug("ip: {} \
+                            channel_state: {} \
+                            open: {} \
+                            choked: {} \
+                            interested: {}"\
+                                .format(ip, \
+                                self.channel_state[ip].state, \
+                                self.channel_state[ip].open,\
+                                self.bt_state[ip].choked, \
+                                self.bt_state[ip].interested))
 
-            if len(self.buffer.complete_pieces) == self.torrent.number_pieces:
+            if len(self.buffer.completed_pieces) == self.torrent.number_pieces:
                 # all pieces received
+                logging.info("completed pieces: {} torrent pieces: {}"\
+                    .format(len(self.buffer.completed_pieces, \
+                    self.torrent.number_pieces)))
                 continue
 
     @asyncio.coroutine
@@ -1062,9 +1088,6 @@ class Client(object):
             logging.info('read_peer: read Handshake from {}'.format(ip))
             try: 
                 msg = yield from self._read_handshake(peer)
-            except NameError as e:
-                print(sys.exec_info()[2])
-                print(e)
             except Exception as e:
                 logging.debug('read_peer: read Handshake error {}'.format(ip))
                 print(e)
