@@ -80,7 +80,7 @@ bt_messages = {0: 'Choke',
 
 bt_messages_by_name = {name: ident for ident, name in bt_messages.items()}
 
-class Piece_Buffer(object):
+class PieceBuffer(object):
     """
     stores the bytes in a piece
     stores up to BUFFER_SIZE pieces
@@ -103,7 +103,7 @@ class Piece_Buffer(object):
 
         piece_index: int
         begin: int
-        block: sequence of bytes
+        block: sequence of bytes (bytearray)
         """
         if not self.piece_info or (self.piece_info and piece_index not in self.piece_info):
             logging.debug("{} not in buffer. Registering piece...".format(piece_index))
@@ -112,7 +112,10 @@ class Piece_Buffer(object):
 
         row = self.piece_info[piece_index]['row']
         # insert block of bytes
-        self.buffer[row][begin:begin+len(block)] = array.array('B', block)
+        ablock = array.array('B', block)
+        logging.debug('insert_bytes: length(ablock) = {}, {}'.format(len(ablock), ablock[:5]))
+        print('insert_bytes: length(block) = {}, {}'.format(len(ablock), ablock[:5]))
+        self.buffer[row][begin:begin+len(ablock)] = ablock
         # update bitfield (each bit represents a byte in the piece)
         self._update_bitfield(piece_index, begin, len(block))
         # check if all bytes received
@@ -181,9 +184,10 @@ class Piece_Buffer(object):
         else:
             sha1 = hashlib.sha1()
             if piece_index != self.torrent.LAST_PIECE_INDEX:
-                return sha1.update(self.buffer[row]).digest()
+                sha1.update(self.buffer[row])
             else:
-                return sha1.update(self.buffer[row][:self.last_piece_length]).digest()
+                sha1.update(self.buffer[row][:self.torrent.last_piece_length])
+            return sha1.digest()
 
     def _is_piece_hash_good(self, piece_index):
         torrent_hash_value = self.torrent.get_hash(piece_index)
@@ -192,7 +196,7 @@ class Piece_Buffer(object):
        
     def _is_all_bytes_received(self, piece_index):
         bf = bin(self.piece_info[piece_index]['bitfield'])[3:]
-        return all(bf)
+        return not('0' in bf)
 
     def _update_bitfield(self, piece_index, begin, length):
         # this needs to be fixed for performance
@@ -325,7 +329,8 @@ class Client(object):
         self.bitfield = None
         self.piece_length = self.torrent.torrent['info']['piece length']
         self.last_piece_length = self._length_of_last_piece()
-        self.buffer = Piece_Buffer(torrent)
+        self.pbuffer = PieceBuffer(torrent)        # PieceBuffer object
+        self.buffer = self.pbuffer.buffer          # buffer attrib of PieceBuffer object
         self.output_fds = self.open_files()
         self.HANDSHAKE = make_handshake(self.torrent.INFO_HASH, self.peer_id)
         self.active_peers = {}  # updated with each tracker response
@@ -410,7 +415,7 @@ class Client(object):
             for ip in dict_of_peers if ip not in self.active_peers})
 
     def open_peers(self):
-        return {ip:peer for ip, peer in self.active_peers if self.channel_state[ip].open}
+        return {ip:peer for ip, peer in self.active_peers.items() if self.channel_state[ip].open}
 
     def _helper_comp(self, an_index):
         """returns the complement of an_index"""
@@ -510,7 +515,7 @@ class Client(object):
                 self._write_piece_to_file(self, piece_index)         
 
     def _write_piece_to_file(self, piece_index):
-        row = self.buffer.piece_info[piece_index]
+        row = self.pbuffer.piece_info[piece_index]
         # write piece to 1 or more files
         bytes_left = self.piece_length                
         start = piece_index * self.torrent.piece_length
@@ -529,7 +534,7 @@ class Client(object):
             else:          # bytes_left are in a single file
                 self._write(self.files[file_index], offset, bytes_left, row)
                 bytes_left = 0
-        self.buffer.reset(piece_index, free_row=True)
+        self.pbuffer.reset(piece_index, free_row=True)
 
     def _write(self, fd, offset, num_bytes, row):  # bug here: start not a param; offset is the param
         fd.write(self.buffer[row][start:start+num_bytes])
@@ -645,7 +650,7 @@ class Client(object):
 
     def _filter_on_not_complete():
             return {pindex: ips for pindex, ips in self.piece_to_peers.items() 
-                    if pindex not in self.buffer.completed_pieces}
+                    if pindex not in self.pbuffer.completed_pieces}
 
     def rcv_have_msg(self, ip, buf):
         """
@@ -715,24 +720,24 @@ class Client(object):
         index = self._4bytes_to_int(buf[5:9])
         begin = self._4bytes_to_int(buf[9:13])
         block = buf[13:]
-        self.buffer.insert_bytes(index, begin, block)
-        if self.buffer.piece_info[index]['hash_verifies']:
+        self.pbuffer.insert_bytes(index, begin, block)
+        if self.pbuffer.piece_info[index]['hash_verifies']:
             self.num_bytes_downloaded += len(block)
             self.num_bytes_left -= self.num_bytes_downloaded
             self.update_bitfield([index])
             # update data structures: piece:{ips} and ip:{pieces}
             self._remove_index_piece_peer_maps(index) 
             # make/send have msg for this piece; send to ips that don't have it
-            self.buffer.piece_info[index]['offset'] = 0
-        elif buffer.is_piece_complete(index):
+            self.pbuffer.piece_info[index]['offset'] = 0
+        elif self.pbuffer.is_piece_complete(index):
             # all bytes received and hash doesn't verify
-            self.buffer.reset(index)
+            self.pbuffer.reset(index)
             # make/send request msg for this piece
-            self.buffer.piece_info[index]['offset'] = 0
+            self.pbuffer.piece_info[index]['offset'] = 0
         else:
             # not all bytes received
             # return next begin
-            self.buffer.piece_info[index]['offset'] = begin + length
+            self.pbuffer.piece_info[index]['offset'] = begin + length
 
     def process_read_msg(self, peer, msg):
         """process incoming msg from peer - protocol state machine
@@ -949,7 +954,7 @@ class Client(object):
             open_peers = {ip: peer for ip, peer in self.active_peers.items() if self.channel_state[ip].open}
             if not open_peers:
                 print('downloader: no active peers...need to connect to a peer')
-                yield from asyncio.sleep(.01)
+                yield from asyncio.sleep(.001)
             else:
                 break
         while not self.piece_to_peers:
@@ -972,10 +977,13 @@ class Client(object):
                     print(e)
                     self._close_peer_connection(peer)
                 except Exception as e:
-                    # check for no open peers
+                    # remote forcibly closed connection
 
                     logging.debug('downloader:  {}: error in reading {}'.format(ip, msg_ident))
-                    print('downloader:  {}: error in reading {}'.format(ip, msg_ident))     
+                    print('downloader:  {}: error in reading {}'.format(ip, msg_ident))
+                    self._close_peer_connection(peer) # bug
+                    if not self.open_peers(): 
+                        return    
                 else:
                     logging.debug("{}: successfully read {}".format(ip, bt_messages[msg_ident]))
                     print("{}: successfully read {}".format(ip, bt_messages[msg_ident]))
@@ -985,7 +993,7 @@ class Client(object):
             
         while self.piece_to_peers:
             # start the piece process:
-            # interested --> request --> process blocks received
+            # interested --> request --> process blocks received --> request ...
         
             # select a piece_index and a peer
             index, ip  = self._get_next_piece()
@@ -1000,35 +1008,37 @@ class Client(object):
                 print("{}: wrote INTERESTED".format(ip))
 
             # if Choked, Read Unchoked
-            if self.channel_state[ip].open and self.bt_state[ip].choked:
-                try:
-                    logging.info("{}: client ready to receive Unchoke".format(ip))
-                    print("{}: client ready to receive Unchoke".format(ip))
-                    self.send_keepalive(peer)
-                    msg_ident = yield from self.read_peer(peer) # read and process
-
-                except ProtocolError as e:
-                    logging.debug('downloader: {} ProtocolError expected Unchoke'.format(ip))
-                    self._close_peer_connection(peer)
-                except ConnectionError as e:
-                    logging.debug('downloader: {} ConnectionError expected Unchoke'.format(ip))
-                    self._close_peer_connection(peer)
-                except Exception as e:
-                    logging.debug('downloader: read Unchoked: Other Exception 2: {} error in reading {}'.format(ip))
-                else:
-                    logging.debug("{}: read {}".format(ip, bt_messages[msg_ident]))
-                    while bt_messages[msg_ident] != 'Unchoke':
+            while bt_messages[msg_ident] != 'Unchoke':
+                if self.channel_state[ip].open and self.bt_state[ip].choked:
+                    try:
+                        logging.info("{}: client ready to receive Unchoke".format(ip))
+                        print("{}: client ready to receive Unchoke".format(ip))
                         self.send_keepalive(peer)
-                        try:
-                            msg_ident = yield from self.read_peer(peer)
-                        except Exception as e:
-                            self._close_peer_connection(peer)
+                        msg_ident = yield from self.read_peer(peer) # read and process
+
+                    except ProtocolError as e:
+                        logging.debug('downloader: {} ProtocolError expected Unchoke'.format(ip))
+                        self._close_peer_connection(peer)
+                    except ConnectionError as e:
+                        logging.debug('downloader: {} ConnectionError expected Unchoke'.format(ip))
+                        self._close_peer_connection(peer)
+                    except Exception as e:
+                        logging.debug('downloader: read Unchoked: Other Exception 2: {} error in reading {}'.format(ip))
+                        self._close_peer_connection(peer)
+                    else:
+                        logging.debug("{}: read {}".format(ip, bt_messages[msg_ident]))
+                else:
+                     # channel is closed or unchoked
+                     break                
             
-            # write Request and read Piece    
-            if self.channel_state[ip].open and not self.bt_state[ip].choked:
-                if index not in self.buffer.completed_pieces:
-                    print('downloader: hope to write Request to {}'.format(ip))
-                    offset = 0 if index not in self.buffer.piece_info else self.buffer.piece_info['index']
+            # write Request and read Piece
+            while index not in self.pbuffer.completed_pieces:     
+                if self.channel_state[ip].open and not self.bt_state[ip].choked:
+
+                    # write Request
+                    offset = 0 if index not in self.pbuffer.piece_info else self.pbuffer.piece_info[index]['offset']
+                    print('downloader: ready to write Request to {} offset: {}'.format(ip, offset))
+                    logging.debug('downloader: ready to write Request to {} offset: {}'.format(ip, offset))
                     msg = self.make_request_msg(index, offset)
                     peer.writer.write(msg)
                     self.process_write_msg(peer, bt_messages_by_name['Request'])
@@ -1036,34 +1046,67 @@ class Client(object):
                     print("{}: wrote Request".format(ip))
                 
                     # read Piece
-                    if self.channel_state[ip].open and not self.bt_state[ip].choked:
-                        try:
-                            yield from self.read_peer(peer)
-                        except (ProtocolError, ConnectionError) as e:
-                            print(e)
-                            self._close_peer_connection(peer)
-                        except Exception as e:
-                            print(e)
-                            self._close_peer_connection(peer)
-                            logging.debug("write request ip: {} \
-                            channel_state: {} \
-                            open: {} \
-                            choked: {} \
-                            interested: {}"\
-                                .format(ip, \
-                                self.channel_state[ip].state, \
-                                self.channel_state[ip].open,\
-                                self.bt_state[ip].choked, \
-                                self.bt_state[ip].interested))
-                            return
-                            if not self.open_peers():
-                                # not more open peers
-                                return
+                
+                    try:
+                        print('downloader: {} expect to receive Piece'.format(ip))
+                        msg_ident = yield from self.read_peer(peer)
+                    except (ProtocolError, ConnectionError) as e:
+                        print(e)
+                        self._close_peer_connection(peer)
+                    except Exception as e:
+                        print(e)
+                        self._close_peer_connection(peer)
+                        logging.debug("write request ip: {} \
+                        channel_state: {} \
+                        open: {} \
+                        choked: {} \
+                        interested: {}"\
+                            .format(ip, \
+                            self.channel_state[ip].state, \
+                            self.channel_state[ip].open,\
+                            self.bt_state[ip].choked, \
+                            self.bt_state[ip].interested))
+                    else:
+                        logging.debug("{}: read {}".format(ip, bt_messages[msg_ident]))
+                        print("{}: read {}".format(ip, bt_messages[msg_ident]))
+                        while bt_messages[msg_ident] != 'Piece':
+                            if self.channel_state[ip].open and not self.bt_state[ip].choked:
+                                try:
+                                    msg_ident = yield from self.read_peer(peer)
+                                except (ProtocolError, ConnectionError) as e:
+                                    print(e)
+                                    self._close_peer_connection(peer)
+                                except Exception as e:
+                                    print(e)
+                                    self._close_peer_connection(peer)
+                                    logging.debug("write request ip: {} \
+                                    channel_state: {} \
+                                    open: {} \
+                                    choked: {} \
+                                    interested: {}"\
+                                        .format(ip, \
+                                        self.channel_state[ip].state, \
+                                        self.channel_state[ip].open,\
+                                        self.bt_state[ip].choked, \
+                                        self.bt_state[ip].interested))
+                                else:
+                                    logging.debug("{}: read {}".format(ip, bt_messages[msg_ident]))
+                                    print("{}: read {}".format(ip, bt_messages[msg_ident]))
+                            else:
+                                # channel is closed or choked
+                                break
 
-            if len(self.buffer.completed_pieces) == self.torrent.number_pieces:
+                        if not self.open_peers():
+                            # no more open peers
+                            return
+                else:
+                    # channel is closed or choked
+                    break
+
+            if len(self.pbuffer.completed_pieces) == self.torrent.number_pieces:
                 # all pieces received
                 logging.info("completed pieces: {} torrent pieces: {}"\
-                    .format(len(self.buffer.completed_pieces, \
+                    .format(len(self.pbuffer.completed_pieces, \
                     self.torrent.number_pieces)))
                 return  # close task
 
