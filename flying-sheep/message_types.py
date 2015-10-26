@@ -547,13 +547,13 @@ class Client(object):
         """initialize bitfield; each bit represents a piece of torrent"""
         num_bytes = math.ceil(self.torrent.number_pieces / 8)
         field = 1 << (8 * num_bytes)
-        for index in map(_helper_comp, list_of_pieces):
+        for index in (self._helper_comp(x) for x in list_of_pieces):
             field |= (1 << index)
         self.bitfield = field
 
     def update_bitfield(self, list_of_pieces):
         """update bitfield with new pieces"""
-        for index in map(_helper_comp, list_of_pieces):
+        for index in (self._helper_comp(x) for x in list_of_pieces):
             self.bitfield |= (1 << index)
 
     def _int_to_4bytes(self, piece_index):
@@ -577,7 +577,6 @@ class Client(object):
 
     def get_indices(self, bitfield):
         b = bytearray(bitfield)
-        #b = ''.join([x[2:] for x in map(bin, b)])
         b = ''.join([bin(x)[2:] for x in b])
         return {i for i, x in enumerate(b) if x == '1'}
 
@@ -737,7 +736,7 @@ class Client(object):
         else:
             # not all bytes received
             # return next begin
-            self.pbuffer.piece_info[index]['offset'] = begin + length
+            self.pbuffer.piece_info[index]['offset'] = begin + length - 9 # lenth of block = length - 9
 
     def process_read_msg(self, peer, msg):
         """process incoming msg from peer - protocol state machine
@@ -1055,7 +1054,6 @@ class Client(object):
                         self._close_peer_connection(peer)
                     except Exception as e:
                         print(e)
-                        self._close_peer_connection(peer)
                         logging.debug("write request ip: {} \
                         channel_state: {} \
                         open: {} \
@@ -1066,6 +1064,10 @@ class Client(object):
                             self.channel_state[ip].open,\
                             self.bt_state[ip].choked, \
                             self.bt_state[ip].interested))
+                        if len(self.open_peers()) == 1:
+                            return
+                        else:
+                            self._close_peer_connection(peer)
                     else:
                         logging.debug("{}: read {}".format(ip, bt_messages[msg_ident]))
                         print("{}: read {}".format(ip, bt_messages[msg_ident]))
