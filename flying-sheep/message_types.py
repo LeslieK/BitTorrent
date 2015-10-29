@@ -670,8 +670,8 @@ class Client(object):
             result += cc[i]
         rarest_index, cnt = result.most_common()[-1]
         set_of_ips = self.piece_to_peers[rarest_index]
-        ip = set_of_ips.pop()
-        set_of_ips.add(ip)  # don't really remove ip from set of peers
+        open_ips = {ip for ip in set_of_ips if self.channel_state[ip].open}
+        ip = open_ips.pop()
         return rarest_index, ip
 
     def _filter_on_not_complete():
