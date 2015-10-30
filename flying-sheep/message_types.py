@@ -25,6 +25,7 @@ logging.captureWarnings(capture=True)
 
 DEFAULT_BLOCK_LENGTH = 2**14
 MAX_PEERS = 50
+BLOCK_SIZE = 16384
 MAX_BLOCK_SIZE = b'\x04\x00\x00\x00' # 2**14 == 16384
 NUMWANT = 5  # GET parameter to tracker
 BUFFER_SIZE = 5
@@ -107,7 +108,7 @@ class PieceBuffer(object):
         begin: int
         block: sequence of bytes (bytearray)
         """
-        if not self.piece_info or (self.piece_info and piece_index not in self.piece_info):
+        if not self.piece_info or piece_index not in self.piece_info:
             logging.debug("{} not in buffer. Registering piece...".format(piece_index))
             print("{} not in buffer. Registering piece...".format(piece_index))
             self._register_piece(piece_index)
@@ -115,21 +116,23 @@ class PieceBuffer(object):
         row = self.piece_info[piece_index]['row']
         # insert block of bytes
         ablock = array.array('B', block)
+
         logging.debug('insert_bytes: length(ablock) = {}, {}'.format(len(ablock), ablock[:5]))
         print('insert_bytes: length(block) = {}, {}'.format(len(ablock), ablock[:5]))
+
         self.buffer[row][begin:begin+len(ablock)] = ablock
-        print('insert_bytes: length(buffer[{}) = {}, {}'\
-            .format(row, len(self.buffer[row]), self.buffer[row][:5]))
-        logging.debug('insert_bytes: PieceBuffer buffer[{}] bitfield: {} \
-        begin: {}'
-            .format(row, bin(self.piece_info[piece_index]['bitfield'])[3:]))
-        # update bitfield (each bit represents a byte in the piece)
-        self._update_bitfield(piece_index, begin, len(block))
-        logging.debug('insert_bytes: PieceBuffer buffer[{}] bitfield: {}'\
-            .format(row, bin(self.piece_info[piece_index]['bitfield'])[3:]))
-        # check if all bytes received
-        if self._is_all_bytes_received(piece_index):
-            self.piece_info[piece_index]['all_bytes_received'] = True
+
+        logging.debug('insert_bytes: PieceBuffer buffer[{}] begin: {}'
+            .format(row, begin))
+        print('insert_bytes: PieceBuffer buffer[{}] begin: {}'
+            .format(row, begin))
+
+        # update bitfield (each bit represents a block in the piece)
+        self._update_bitfield(piece_index)
+
+        # check if all blocks received
+        if self._is_all_blocks_received(piece_index):
+            self.piece_info[piece_index]['all_blocks_received'] = True
             if self._is_piece_hash_good(piece_index):
                 # all bytes received
                 # piece hash matches torrent hash
@@ -157,7 +160,6 @@ class PieceBuffer(object):
             del self.piece_info[piece_index]
             self.free_rows.add(row)  # add row to set of available rows
 
-
     def pieces_in_buffer(self):
         """returns a generator object that generates indices of pieces in buffer"""
         return (piece_index for piece_index in self.piece_info.keys())
@@ -177,7 +179,7 @@ class PieceBuffer(object):
             raise BufferFullError("Buffer is full")
         else:
             self.piece_info[piece_index] = {'row': row,
-                                    'all_bytes_received': False,
+                                    'all_blocks_received': False,
                                     'hash_verifies': False,
                                     'bitfield': self._init_bitfield(piece_index),
                                     'offset': 0
@@ -203,34 +205,50 @@ class PieceBuffer(object):
         piece_hash_value = self._sha1_hash(piece_index)
         return torrent_hash_value == piece_hash_value
        
-    def _is_all_bytes_received(self, piece_index):
+    def _is_all_blocks_received(self, piece_index):
         """
         returns True if bitfield has no "0"
         """
         bf = bin(self.piece_info[piece_index]['bitfield'])[3:]
         return not('0' in bf)
-        #return self.piece_info[piece_index]['bitfield'] + 1 == \
-        #    2**((self.torrent.torrent['info']['piece length'] // MAX_BLOCK_SIZE) + 1)
 
     def _init_bitfield(self, piece_index):
         """
-        init bitfield for buffer row 
+        init bitfield for a buffer row 
         all bits initialized to 0
-        rightmost bit (LSB): block 0
+        rightmost bit (LSB): block 
         """
-        field = 1 << self.torrent.piece_length if piece_index != self.torrent.number_pieces - 1\
-                                              else 1 << self.torrent.last_piece_length
+        try:
+            if piece_index != self.torrent.number_pieces - 1:
+                number_of_blocks = self.torrent.piece_length // BLOCK_SIZE 
+            else:
+                number_of_blocks = self.torrent.last_piece_length // BLOCK_SIZE
+        except Exception as e:
+            print(e.args) 
+             
+        field = 1 << number_of_blocks
         return field
     
-    def _update_bitfield(self, begin, length):
+    def _update_bitfield(self, piece_index):
         """
         update bitfield for buffer row
-        leftmost bit (LSB): block 0
+        each bit represents a block
+        rightmost bit (LSB): block 0
         """
-        # this needs to be fixed for performance
-        for i in range(begin+1, begin+1 + length):
-            bitfield |= (1 << i)
-        return bitfield
+        block_number = self.piece_info[piece_index]['offset'] // BLOCK_SIZE
+
+        bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
+        length = len(bfs)
+        logging.debug('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
+        print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
+
+        self.piece_info[piece_index]['bitfield'] |= 1 << block_number
+
+        bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
+        length = len(bfs)
+        logging.debug('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
+        print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
+
 
 
 
@@ -790,7 +808,10 @@ class Client(object):
         index = self._4bytes_to_int(buf[5:9])
         begin = self._4bytes_to_int(buf[9:13])
         block = buf[13:]
-        result = self.pbuffer.insert_bytes(index, begin, block)
+        try:
+            result = self.pbuffer.insert_bytes(index, begin, block)
+        except Exception as e:
+            print(e.args)
         if result is 'done':
             # piece is complete and hash verifies
             self.num_bytes_downloaded += len(block)
@@ -800,14 +821,14 @@ class Client(object):
             # self._remove_index_piece_peer_maps(index) 
             # make/send have msg for this piece; send to ips that don't have it
             self.pbuffer.piece_info[index]['offset'] = 0
-        elif result is 'not done':
-            # all bytes received and hash doesn't verify
+        elif result is 'bad hash':
+            # all blocks received and hash doesn't verify
             self.pbuffer.reset(index)
             # make/send request msg for this piece
             self.pbuffer.piece_info[index]['offset'] = 0
         else:
-            # not all bytes received
-            # return next begin
+            # not all blocks received
+            # increment offset
             self.pbuffer.piece_info[index]['offset'] = begin + length - 9 # lenth of block = length - 9
 
     def process_read_msg(self, peer, msg):
