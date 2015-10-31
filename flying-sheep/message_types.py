@@ -250,9 +250,6 @@ class PieceBuffer(object):
         print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
 
 
-
-
-
 class Message(object):
     def __init__(self, name):
         self.name = name
@@ -483,6 +480,8 @@ class Client(object):
         # close channel state
         self.channel_state[ip].open = 0
         self.channel_state[ip].state = 0
+        self.bt_state[ip].choked = 1
+        self.bt_state[ip].interested = 0
         # remove ip from data structures
         #if ip in self.peer_to_pieces:
         #    self._remove_ip_piece_peer_maps(ip)
@@ -547,6 +546,11 @@ class Client(object):
 
     def _length_of_last_piece(self):
         return self.total_files_length - self.piece_length * (self.torrent.number_pieces - 1)
+
+    def _piece_length(self, piece_index):
+        bytes_in_piece = self.piece_length if piece_index != self.torrent.LAST_PIECE_INDEX \
+            else self.last_piece_length
+        return bytes_in_piece
 
     def _number_of_bytes_left(self):
         return self.total_files_length - self.num_bytes_downloaded
@@ -814,7 +818,10 @@ class Client(object):
             print(e.args)
         if result is 'done':
             # piece is complete and hash verifies
-            self.num_bytes_downloaded += len(block)
+            try:
+                self.num_bytes_downloaded += self._piece_length(index)
+            except Exception as e:
+                print(e.args)
             self.num_bytes_left -= self.num_bytes_downloaded
             self.update_bitfield([index])  # updates self.bitfield
             # update data structures: piece:{ips} and ip:{pieces}
