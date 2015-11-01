@@ -474,6 +474,7 @@ class Client(object):
             return {ip:peer for ip, peer in self.active_peers.items() if self.channel_state[ip].open}
 
     def reset_keepalive(self, peer):
+        # timer stores the last time client wrote to peer
         peer._client_keepalive_timer = datetime.datetime.utcnow()
 
     def _close_peer_connection(self, peer):
@@ -742,6 +743,9 @@ class Client(object):
         ip = open_ips.pop()
         return rarest_index, ip
 
+    def all_pieces(self):
+        return len(self.pbuffer.completed_pieces) == self.torrent.number_pieces
+
     def _filter_on_not_complete():
             return {pindex: ips for pindex, ips in self.piece_to_peers.items() 
                     if pindex not in self.pbuffer.completed_pieces}
@@ -822,15 +826,19 @@ class Client(object):
             print(e.args)
         if result is 'done':
             # piece is complete and hash verifies
+
+            # update num bytes downloaded and num bytes left
+            bytes_in_piece = self._piece_length(index)
+            self.num_bytes_downloaded += bytes_in_piece
+            self.num_bytes_left -= bytes_in_piece
+            # updates self.bitfield
+            self.update_bitfield([index])  
+            # send Not Interested msg to peer
             try:
-                self.num_bytes_downloaded += self._piece_length(index)
+                peer.writer.write(NOT_INTERESTED)
             except Exception as e:
                 print(e.args)
-            self.num_bytes_left -= self.num_bytes_downloaded
-            self.update_bitfield([index])  # updates self.bitfield
-            # update data structures: piece:{ips} and ip:{pieces}
-            # self._remove_index_piece_peer_maps(index) 
-            # make/send have msg for this piece; send to ips that don't have it
+            process_write_msg(self, peer, bt_messages_by_name['Not Interested'])
             self.pbuffer.piece_info[index]['offset'] = 0
         elif result is 'bad hash':
             # all blocks received and hash doesn't verify
@@ -1020,6 +1028,7 @@ class Client(object):
         piece
         """
         ip, port = peer.address
+        self.reset_keepalive(peer)
         if ident == 2:
             # client writes Interested to peer
             self.bt_state[ip].interested = 1  # client interested in peer
@@ -1280,172 +1289,188 @@ class Client(object):
             print(e.args)
             logging.debug("connect_to_peer: Other Exception..{}: {}".format(e, ip))
             return
-        else:
-            # successful connection to peer
-            # write Handshake
-            self._open_peer_connection(peer, reader, writer)
-            logging.info('connect_to_peer {}: connection open'.format(ip))
-            print('connect_to_peer {}: connection open'.format(ip))       
+
+        # successful connection to peer
+        # write Handshake
+        self._open_peer_connection(peer, reader, writer)
+
+        logging.info('connect_to_peer {}: connection open'.format(ip))
+        print('connect_to_peer {}: connection open'.format(ip))       
             
-            while not peer.has_pieces:
-                # no bitfield or have msgs yet
-                logging.info('connnect_to_peer {}: while loop: (no bitfield/have)'.format(ip))
-                print('connect_to_peer {}: while loop: (no bitfield/have)'.format(ip))
+        while not peer.has_pieces:
+            # no bitfield or have msgs yet
+            logging.info('connnect_to_peer {}: while loop: (no bitfield/have)'.format(ip))
+            print('connect_to_peer {}: while loop: (no bitfield/have)'.format(ip))
 
+            try:    
+                msg_ident = yield from self.read_peer(peer)
+
+            except (ProtocolError, TimeoutError, OSError) as e:
+                print(e.args)
+                logging.debug("downloader: {}: reading bitfield/have {}".format(ip, e.args))
+                self._close_peer_connection(peer)
+            except Exception as e:
+                print(e.args)
+                logging.debug('downloader:  {}: reading bitfield/have {}'.format(ip, e.args))
+                print('downloader:  {}: error in reading {}'.format(ip, msg_ident))
+                self._close_peer_connection(peer)
+            
+            logging.debug("connect_to_peer: {}: successfully read {}".format(ip, bt_messages[msg_ident]))
+            print("connect_to_peer: {}: successfully read {}".format(ip, bt_messages[msg_ident]))
+            
+        # wait until all peers have replied with bitfield or have
+        while True:
+            num_open_ips = sum(1 for ip in self.channel_state if self.channel_state[ip].open)
+            if num_open_ips + self.closed_ips_cnt < NUMWANT:
+                # some peers have not been connected yet
+                yield
+            else:
+                # all connections to peers are open
+                break
+
+        # start the piece process
+        # interested --> request --> process blocks received --> request -->...
+
+        while not self.all_pieces():
+            # not all pieces complete
+
+            # select a piece_index and a peer
+            index, ip  = self._get_next_piece()
+            peer = self.active_peers[ip]
+
+            # if not interested: write Interested
+            if self.channel_state[ip].open and \
+            not self.bt_state[ip].interested:
+                
+                # write Interested to peer
                 try:
-                    logging.info('connect_to_peer: read_peer: {}'.format(ip))
-                    
-                    msg_ident = yield from self.read_peer(peer)
-
-                except (ProtocolError, TimeoutError, OSError) as e:
-                    print(e.args)
-                    logging.debug("downloader: {}: reading bitfield/have {}".format(ip, e.args))
-                    self._close_peer_connection(peer)
+                    peer.writer.write(INTERESTED)
                 except Exception as e:
                     print(e.args)
-                    logging.debug('downloader:  {}: reading bitfield/have {}'.format(ip, e.args))
-                    print('downloader:  {}: error in reading {}'.format(ip, msg_ident))
                     self._close_peer_connection(peer)
-                else:
-                    logging.debug("connect_to_peer: {}: successfully read {}".format(ip, bt_messages[msg_ident]))
-                    print("connect_to_peer: {}: successfully read {}".format(ip, bt_messages[msg_ident]))
-            
-            # wait until all peers have replied with bitfield or have
-            while True:
-                open_ips = sum(1 for ip in self.channel_state if self.channel_state[ip].open)
-                if open_ips + self.closed_ips_cnt < NUMWANT:
-                    # some peers have not been connected yet
-                    yield
-                else:
-                    # all connections to peers are open
-                    break
 
-            # start the piece process
-            # interested --> request --> process blocks received --> request -->...
-
-            while len(self.pbuffer.completed_pieces) < self.torrent.number_pieces:
-                # select a piece_index and a peer
-                    index, ip  = self._get_next_piece()
-                    peer = self.active_peers[ip]
-
-                    # write Interested
-                    if self.channel_state[ip].open and not self.bt_state[ip].interested:
+                self.process_write_msg(peer, bt_messages_by_name['Interested'])
                 
+                logging.debug("connect_to_peer: {}: wrote INTERESTED".format(ip))
+                print("connect_to_peer: {}: wrote INTERESTED".format(ip))
+            else:
+                # channel is closed or client is already interested
+                pass
+
+            # if Choked, Read until Unchoked
+            while self.channel_state[ip].open and \
+                self.bt_state[ip].choked:
+                if bt_messages[msg_ident] != 'Unchoke':
+                    try:
+                        logging.info("{}: client ready to receive Unchoke".format(ip))
+                        print("{}: client ready to receive Unchoke".format(ip))
+
+                        msg_ident = yield from self.read_peer(peer) # read and process
+
+                    except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
+                        logging.debug('connect_to_peer: {} expected Unchoke {}'.format(ip, e.args))
+                        print('downloader: {} expected Unchoke {}'.format(ip, e.args))
+                        self._close_peer_connection(peer)
+                    except Exception as e:
+                        logging.debug('connect_to_peer: {} expected Unchoke Other Exception 2 {}'.format(ip, e.args))
+                        print('connect_to_peer: {} expected Unchoke {}'.format(ip, e.args))
+                        self._close_peer_connection(peer)
+                    finally:
+                        if not self.active_peers:
+                            # close Task so loop stops and program can reconnect to Tracker 
+                            return
+                    logging.debug("connect_to_peer: {}: read {}".format(ip, bt_messages[msg_ident]))
+                else:
+                    # received Unchoke
+                    pass
+            # channel is closed or already unchoked
+                 
+            # write Request and read Piece
+            if self.channel_state[ip].open and \
+                not self.bt_state[ip].choked and \
+                index not in self.pbuffer.completed_pieces:
+                        # write Request
+                        offset = 0 if index not in self.pbuffer.piece_info else self.pbuffer.piece_info[index]['offset']
+                        print('connect_to_ip: ready to write Request to {} offset: {}'.format(ip, offset))
+                        logging.debug('connect_to_peer: ready to write Request to {} offset: {}'.format(ip, offset))
+                        msg = self.make_request_msg(index, offset)
+                    
                         try:
-                            peer.writer.write(INTERESTED)
+                            peer.writer.write(msg)
                         except Exception as e:
                             print(e.args)
                             self._close_peer_connection(peer)
-
-                        self.process_write_msg(peer, bt_messages_by_name['Interested'])
-                        self.reset_keepalive(peer)
-                
-                        logging.debug("{}: wrote INTERESTED".format(ip))
-                        print("{}: wrote INTERESTED".format(ip))
-
-                    # if Choked, Read Unchoked
-                    while bt_messages[msg_ident] != 'Unchoke':
-                        if self.channel_state[ip].open and self.bt_state[ip].choked:
-                            try:
-                                logging.info("{}: client ready to receive Unchoke".format(ip))
-                                print("{}: client ready to receive Unchoke".format(ip))
-                                self.send_keepalive(peer)
-                                msg_ident = yield from self.read_peer(peer) # read and process
-                            except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
-                                logging.debug('connect_to_peer: {} expected Unchoke {}'.format(ip, e.args))
-                                print('downloader: {} expected Unchoke {}'.format(ip, e.args))
-                                self._close_peer_connection(peer)
-                            except Exception as e:
-                                logging.debug('connect_to_peer: {} expected Unchoke Other Exception 2 {}'.format(ip, e.args))
-                                print('connect_to_peer: {} expected Unchoke {}'.format(ip, e.args))
-                                self._close_peer_connection(peer)
-                            finally:
-                                if not self.active_peers:
-                                    # close Task so loop stops and program can reconnect to Tracker 
-                                    return
-                            logging.debug("connect_to_peer: {}: read {}".format(ip, bt_messages[msg_ident]))
-                        else:
-                             # channel is closed or unchoked
-                             break
-                 
-                    # write Request and read Piece
-                    while index not in self.pbuffer.completed_pieces and \
-                        self.channel_state[ip].open and not self.bt_state[ip].choked:
-                            # write Request
-                            offset = 0 if index not in self.pbuffer.piece_info else self.pbuffer.piece_info[index]['offset']
-                            print('connect_to_ip: ready to write Request to {} offset: {}'.format(ip, offset))
-                            logging.debug('connect_to_peer: ready to write Request to {} offset: {}'.format(ip, offset))
-                            msg = self.make_request_msg(index, offset)
                     
-                            try:
-                                peer.writer.write(msg)
-                            except Exception as e:
-                                print(e.args)
-                                self._close_peer_connection(peer)
-                    
-                            self.process_write_msg(peer, bt_messages_by_name['Request'])
-                            logging.debug("connect_to_peer: {}: wrote Request".format(ip))
-                            print("connect_to_peer: {}: wrote Request".format(ip))
+                        self.process_write_msg(peer, bt_messages_by_name['Request'])
+                        logging.debug("connect_to_peer: {}: wrote Request".format(ip))
+                        print("connect_to_peer: {}: wrote Request".format(ip))
+                        print('connect_to_peer: {} expect to receive Piece'.format(ip))
                 
-                            # read Piece
-                            try:
-                                print('connect_to_peer: {} expect to receive Piece'.format(ip))
+                        # read until Piece
+                        try:
+                            msg_ident = yield from self.read_peer(peer)
 
-                                msg_ident = yield from self.read_peer(peer)
+                        except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
+                            logging.debug('connect_to_peer: {} expected Piece {}'.format(ip, e.args))
+                            print('connect_to_peer: {} expected Piece {}'.format(ip, e.args))
+                            self._close_peer_connection(peer)
+                        except Exception as e:
+                            print(e)
+                            logging.debug("connect_to_peer: expect to read Piece from ip: {} {} \
+                            channel_state: {} \
+                            open: {} \
+                            choked: {} \
+                            interested: {}"\
+                                .format(e.args, ip, \
+                                self.channel_state[ip].state, \
+                                self.channel_state[ip].open,\
+                                self.bt_state[ip].choked, \
+                                self.bt_state[ip].interested))
+                            self._close_peer_connection(peer)
 
-                            except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
-                                logging.debug('downloader: {} expected Piece {}'.format(ip, e.args))
-                                print('downloader: {} expected Piece {}'.format(ip, e.args))
-                                self._close_peer_connection(peer)
-                            except Exception as e:
-                                print(e)
-                                logging.debug("downloader: expect to read Piece from ip: {} {} \
-                                channel_state: {} \
-                                open: {} \
-                                choked: {} \
-                                interested: {}"\
-                                    .format(e.args, ip, \
-                                    self.channel_state[ip].state, \
-                                    self.channel_state[ip].open,\
-                                    self.bt_state[ip].choked, \
-                                    self.bt_state[ip].interested))
-                                self._close_peer_connection(peer)
-                            logging.debug("{}: read {}".format(ip, bt_messages[msg_ident]))
-                            print("{}: read {}".format(ip, bt_messages[msg_ident]))
+                        logging.debug("connect_to_peer: {}: read {}".format(ip, bt_messages[msg_ident]))
+                        print("connect_to_peer: {}: read {}".format(ip, bt_messages[msg_ident]))
 
-                            while bt_messages[msg_ident] != 'Piece':
-                                if self.channel_state[ip].open and not self.bt_state[ip].choked:
-                                    try:
-                                        msg_ident = yield from self.read_peer(peer)
+                        while bt_messages[msg_ident] != 'Piece' and \
+                                self.channel_state[ip].open and \
+                                not self.bt_state[ip].choked:
+                                try:
+                                    msg_ident = yield from self.read_peer(peer)
 
-                                    except (ProtocolError, ConnectionError, TimeoutError, OSError) as e:
-                                        logging.debug('downloader: {} reading for Piece {}'.format(ip, e.args))
-                                        print('downloader: {} reading for Piece {}'.format(ip, e.args))
-                                        self._close_peer_connection(peer)
-                                    except Exception as e:
-                                        print(e.args)
-                                        logging.debug("downloader: reading for Piece  ip: {} \
-                                        channel_state: {} \
-                                        open: {} \
-                                        choked: {} \
-                                        interested: {}"\
-                                            .format(ip, \
-                                            self.channel_state[ip].state, \
-                                            self.channel_state[ip].open,\
-                                            self.bt_state[ip].choked, \
-                                            self.bt_state[ip].interested))
-                                        self._close_peer_connection(peer)
-                                    finally:
-                                        if not self.active_peers:
-                                            # no open connections
-                                            return
-                                    logging.debug("connect_to_peer: {}: read {}".format(ip, bt_messages[msg_ident]))
-                                    print("connect_to_peer: {}: read {}".format(ip, bt_messages[msg_ident]))
-                        # piece is complete or channel is closed or client is choked
-                            break
-                    # piece is complete or channel is closed or channel is choked
-            # all pieces downloaded
-            return
+                                except (ProtocolError, ConnectionError, TimeoutError, OSError) as e:
+                                    logging.debug('downloader: {} reading for Piece {}'.format(ip, e.args))
+                                    print('downloader: {} reading for Piece {}'.format(ip, e.args))
+                                    self._close_peer_connection(peer)
+                                except Exception as e:
+                                    print(e.args)
+                                    logging.debug("downloader: reading for Piece  ip: {} \
+                                    channel_state: {} \
+                                    open: {} \
+                                    choked: {} \
+                                    interested: {}"\
+                                        .format(ip, \
+                                        self.channel_state[ip].state, \
+                                        self.channel_state[ip].open,\
+                                        self.bt_state[ip].choked, \
+                                        self.bt_state[ip].interested))
+                                    self._close_peer_connection(peer)
+                                finally:
+                                    if not self.active_peers:
+                                        # no open connections
+                                        return
+                                logging.debug("connect_to_peer: {}: read {}".format(ip, bt_messages[msg_ident]))
+                                print("connect_to_peer: {}: read {}".format(ip, bt_messages[msg_ident]))
+                        # received Piece msg
+                        # top of while loop: if not all_pieces(), get a piece index 
+                        # (could be the same as a previous time)
+            else:
+                # channel is closed, choked, or piece is complete
+                # top of while loop: if not all_pieces(), get a piece index
+                # (could be the same as a previous time
+                pass
+            
+        # all pieces downloaded
+        return
                             
                 
     @asyncio.coroutine
