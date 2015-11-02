@@ -4,6 +4,7 @@ This module implements a BitTorrent client without extensions.
 from bcoding import bdecode, bencode
 from collections import defaultdict, Counter
 import math
+import random
 import hashlib
 import array
 import bisect
@@ -26,10 +27,10 @@ logging.captureWarnings(capture=True)
 DEFAULT_BLOCK_LENGTH = 2**14
 MAX_PEERS = 50
 BLOCK_SIZE = 16384
-MAX_BLOCK_SIZE = b'\x04\x00\x00\x00' # 2**14 == 16384
+MAX_BLOCK_SIZE = bytes([4, 0, 0, 0]) # 2**14 == 16384
 NUMWANT = 5  # GET parameter to tracker
 BUFFER_SIZE = 5
-CHANNEL_TIMEOUT = datetime.timedelta(seconds=90)
+CONNECTION_TIMEOUT = datetime.timedelta(seconds=90)
 HANDSHAKE_ID = 100
 KEEPALIVE_ID = 200
 NOTSUPPORTED_ID = 300
@@ -37,11 +38,11 @@ NOTSUPPORTED_ID = 300
 PORTS = [i for i in range(6881, 6890)]
 events = ['started', 'stopped', 'completed']
 
-KEEPALIVE = b'\x00\x00\x00\x00'
-CHOKE = b'\x00\x00\x00\x01' + b'\x00'
-UNCHOKE = b'\x00\x00\x00\x01' + b'\x01'
-INTERESTED = b'\x00\x00\x00\x01' + b'\x02'
-NOT_INTERESTED = b'\x00\x00\x00\x01' + b'\x03'
+KEEPALIVE = bytes([0, 0, 0, 0])
+CHOKE = bytes([0, 0, 0, 1]) + bytes([0])
+UNCHOKE = bytes([0, 0, 0, 1]) + bytes([1])
+INTERESTED = bytes([0, 0, 0, 1]) + bytes([2])
+NOT_INTERESTED = bytes([0, 0, 0, 1]) + bytes([3])
 
 class ConnectionError(Exception):
     pass
@@ -250,19 +251,6 @@ class PieceBuffer(object):
         print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
 
 
-class Message(object):
-    def __init__(self, name):
-        self.name = name
-        self.ident = bt_messages[name]['id']
-        self.length = bt_messages[name]['length']
-        
-    def is_valid():
-        raise NotImplementedError
-
-    def send(to_peer, payload=None):
-        """ to_peer: tuple([ip, port])"""
-        raise NotImplementedError
-
 class TorrentWrapper(object):
     """
     for a multi-file torrent, the piece indices are in the order of the files in the 'files' element.
@@ -377,10 +365,10 @@ class Client(object):
         self.bt_state = {}
         self.channel_state = {}
         self.piece_to_peers = defaultdict(set)
-        self.peer_to_pieces = defaultdict(set)
+        #self.peer_to_pieces = defaultdict(set)
         self.piece_cnts = Counter()
         self.closed_ips_cnt = 0
-        #self.timer = datetime.datetime.utcnow() 
+        # store last time tracker was contacted
         self.tracker_timer = datetime.datetime.utcnow()
         self.tracker_request_interval = datetime.timedelta(seconds=0)
     
@@ -485,22 +473,15 @@ class Client(object):
         self.channel_state[ip].state = 0
         self.bt_state[ip].choked = 1
         self.bt_state[ip].interested = 0
-        # remove ip from data structures
-        #if ip in self.peer_to_pieces:
-        #    self._remove_ip_piece_peer_maps(ip)
-        # remove from self.active_peers
         del self.active_peers[ip]
-        #if not self.active_peers:
-        #    # no peers left
-        #    logging.debug('{}: last connection closed... no peers left'.format(ip))
-        #    return False  # closed the last peer connection
-        # close connection
+        # close reader, writer
         peer.reader.set_exception(None)
         peer.writer.close()
+        # incr number of closed connections
         self.closed_ips_cnt += 1
         logging.debug('{}: cleaned up after closing connection'.format(ip))
         print('{}: cleaned up after closing connection'.format(ip))
-        return True # not sure why
+        return True
 
     def _open_peer_connection(self, peer, reader, writer):
         """
@@ -517,35 +498,6 @@ class Client(object):
         logging.debug('write Handshake to {}'.format(ip))
         peer.writer.write(self.HANDSHAKE)
         self.reset_keepalive(peer)
-
-    #def _remove_ip_piece_peer_maps(self, ip):
-    #    """
-    #    removes the ip from the maps:
-    #    self.peer_to_pieces
-    #    self.piece_to_peers
-    #    (map stores peer as an ip address not peer object)
-    #    """
-    #    if ip in self.peer_to_pieces:
-    #        for pindex in self.peer_to_pieces[ip]:
-    #            if len(self.piece_to_peers[pindex]) == 1:
-    #                del self.piece_to_peers[pindex]
-    #            else:
-    #                self.piece_to_peers[pindex].remove(ip)
-    #        del self.peer_to_pieces[ip]
-
-    #def _remove_index_piece_peer_maps(self, index):
-    #    """
-    #    removes the piece_index from the maps:
-    #    self.piece_to_peers
-    #    self.peer_to_pieces
-    #    (map stores 'ip address' not peer object)
-    #    """
-    #    for ip in self.piece_to_peers[index]:
-    #        self.peer_to_pieces[ip].remove(index)
-    #        # remove keys with empty values
-    #        if not self.peer_to_pieces[ip]:
-    #            del self.peer_to_pieces[ip]
-    #    del self.piece_to_peers[index]
 
     def _length_of_last_piece(self):
         return self.total_files_length - self.piece_length * (self.torrent.number_pieces - 1)
@@ -733,15 +685,22 @@ class Client(object):
         2. peer.has_pieces is a set of piece indices
         3. get most rare piece that client doesn't already have
         """
-        result = Counter() 
-        cc = [Counter(peer.has_pieces) for peer in self.active_peers.values()]
-        for i in range(len(cc)):
-            result += cc[i]
-        rarest_index, cnt = result.most_common()[-1]
-        set_of_ips = self.piece_to_peers[rarest_index]
-        open_ips = {ip for ip in set_of_ips if self.channel_state[ip].open}
-        ip = open_ips.pop()
-        return rarest_index, ip
+        rarest_index, cnt = self._rarest_piece()
+        ips = [ip for ip in self.piece_to_peers[rarest_index] \
+            if self.channel_state[ip].open]
+        if ips:
+            ip = random.choice(set_of_ips)
+            return rarest_index, ip
+        else:
+            # no open connections
+            return None, None
+
+    def _rarest_piece(self):
+        """return rarest piece and the number of peers that have it;
+         piece is removed from Counter only after all blocks have 
+         been received and hash verifies"""
+
+        return self.piece_cnts.most_common()[-1]
 
     def all_pieces(self):
         return len(self.pbuffer.completed_pieces) == self.torrent.number_pieces
@@ -763,7 +722,7 @@ class Client(object):
         # update data structures
         self.active_peers[ip].has_pieces.add(msgd['piece index'])
         self.piece_to_peers[msgd['piece index']].add(ip)
-        self.peer_to_pieces[ip].add(msgd['piece index'])
+        #self.peer_to_pieces[ip].add(msgd['piece index'])
         self.piece_cnts[msgd['piece index']] += 1
         return msgd
 
@@ -782,7 +741,7 @@ class Client(object):
         # update data structures
         for piece in self.active_peers[ip].has_pieces:
             self.piece_to_peers[piece].add(ip)
-            self.peer_to_pieces[ip].add(piece)
+            #self.peer_to_pieces[ip].add(piece)
             self.piece_cnts[piece] += 1
         return msgd
 
@@ -832,13 +791,16 @@ class Client(object):
             self.num_bytes_downloaded += bytes_in_piece
             self.num_bytes_left -= bytes_in_piece
             # updates self.bitfield
-            self.update_bitfield([index])  
+            self.update_bitfield([index])
+            # update self.piece_cnts (Counter of pieces to download)
+            del self.piece_cnts[index]  
             # send Not Interested msg to peer
             try:
                 peer.writer.write(NOT_INTERESTED)
             except Exception as e:
                 print(e.args)
             process_write_msg(self, peer, bt_messages_by_name['Not Interested'])
+            # set offset to 0
             self.pbuffer.piece_info[index]['offset'] = 0
         elif result is 'bad hash':
             # all blocks received and hash doesn't verify
@@ -1243,25 +1205,25 @@ class Client(object):
     def uploader(self):
         pass
 
-    def downloader_clean_up(self):
-        # piece: ips and ip:pieces data structures
-        self.piece_to_peers = {}
-        self.peer_to_pieces = {}
+    #def downloader_clean_up(self):
+    #    # piece: ips and ip:pieces data structures
+    #    self.piece_to_peers = {}
+    #    self.peer_to_pieces = {}
 
-    def close_quiet_channels(self):
+    @asyncio.coroutine
+    def close_quiet_connections(self, peer):
         """
-        closes channels that have timed out
-        timeout is CHANNEL_TIMEOUT secs
+        close a connection that has timed out
+        timeout is CONNECTION_TIMEOUT secs
         """
-        for peer in self.active_peers.values():
-            if datetime.datetime.utcnow() - peer.timer > CHANNEL_TIMEOUT:
-                # close channel
-                self._close_peer_connection(peer)
+        if datetime.datetime.utcnow() - peer._timer > CONNECTION_TIMEOUT:
+            # close connection
+            self._close_peer_connection(peer)
     
     @asyncio.coroutine            
     def send_keepalive(self, peer):
-        """sends keep_alive to peer if timer was updated > CHANNEL_TIMEOUT secs ago"""
-        if datetime.datetime.utcnow() - peer._client_keepalive_timer > CHANNEL_TIMEOUT:
+        """sends keep_alive to peer if timer was updated > CONNECTION_TIMEOUT secs ago"""
+        if datetime.datetime.utcnow() - peer._client_keepalive_timer > CONNECTION_TIMEOUT:
 
             peer.writer.write(KEEPALIVE)
             yield from writer.drain()
@@ -1281,13 +1243,17 @@ class Client(object):
         logging.info('connect_to_peer {}'.format(ip))
         try:
             reader, writer = yield from asyncio.open_connection(host=ip, port=port)
-        except (TimeoutError, OSError) as e:
+        except (TimeoutError, OSError, ConnectionError) as e:
             print(e.args)
             logging.debug("connect_to_peer: TimeoutError: {}".format(ip))
+            self.closed_ips_cnt += 1
+            del self.active_peers[ip]
             return
         except Exception as e:
             print(e.args)
             logging.debug("connect_to_peer: Other Exception..{}: {}".format(e, ip))
+            self.closed_ips_cnt += 1
+            del self.active_peers[ip]
             return
 
         # successful connection to peer
@@ -1305,7 +1271,7 @@ class Client(object):
             try:    
                 msg_ident = yield from self.read_peer(peer)
 
-            except (ProtocolError, TimeoutError, OSError) as e:
+            except (ProtocolError, TimeoutError, OSError, ConnectionError) as e:
                 print(e.args)
                 logging.debug("downloader: {}: reading bitfield/have {}".format(ip, e.args))
                 self._close_peer_connection(peer)
@@ -1321,7 +1287,7 @@ class Client(object):
         # wait until all peers have replied with bitfield or have
         while True:
             num_open_ips = sum(1 for ip in self.channel_state if self.channel_state[ip].open)
-            if num_open_ips + self.closed_ips_cnt < NUMWANT:
+            if len(self.active_peers) - num_open_ips > 0:
                 # some peers have not been connected yet
                 yield
             else:
@@ -1410,7 +1376,7 @@ class Client(object):
                         try:
                             msg_ident = yield from self.read_peer(peer)
 
-                        except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
+                        except (ProtocolError, TimeoutError, OSError) as e:
                             logging.debug('connect_to_peer: {} expected Piece {}'.format(ip, e.args))
                             print('connect_to_peer: {} expected Piece {}'.format(ip, e.args))
                             self._close_peer_connection(peer)
@@ -1437,7 +1403,7 @@ class Client(object):
                                 try:
                                     msg_ident = yield from self.read_peer(peer)
 
-                                except (ProtocolError, ConnectionError, TimeoutError, OSError) as e:
+                                except (ProtocolError, TimeoutError, OSError) as e:
                                     logging.debug('downloader: {} reading for Piece {}'.format(ip, e.args))
                                     print('downloader: {} reading for Piece {}'.format(ip, e.args))
                                     self._close_peer_connection(peer)
@@ -1466,7 +1432,7 @@ class Client(object):
             else:
                 # channel is closed, choked, or piece is complete
                 # top of while loop: if not all_pieces(), get a piece index
-                # (could be the same as a previous time
+                # (could be the same as a previous time)
                 pass
             
         # all pieces downloaded
@@ -1513,6 +1479,10 @@ class Client(object):
             logging.info('read_peer: read Handshake from {}'.format(ip))
             try: 
                 msg = yield from self._read_handshake(peer)
+
+            except ConnectionError as e:
+                print(e.args)
+                raise ConnectionError
 
             except Exception as e:
                 logging.debug('read_peer {}: read Handshake error {}'.format(ip, e.args))
@@ -1601,14 +1571,13 @@ if __name__ == "__main__":
         port_index = (port_index + 1) % len(PORTS)  
         
         if success:
-            tasks_keep_alive = [client.send_keepalive(peer) for peer in client.active_peers.values()]
-            tasks_connect = [client.connect_to_peer(peer) for peer in client.active_peers.values()]
-            try:
-                loop.run_until_complete(asyncio.wait(tasks_connect + tasks_keep_alive))
-            except Exception:
-                logging.debug('exception received at top level')
-                print('exception received at top level')
-                pass
+            tasks_connect = [client.connect_to_peer(peer) \
+                for peer in client.active_peers.values()]
+            #tasks_keep_alive = [client.send_keepalive(peer) \
+            #    for peer in client.active_peers.values()]
+            #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
+            #    for peer in client.active_peers.values()]
+            loop.run_until_complete(asyncio.wait(tasks_connect))
 
     loop.close()
 
