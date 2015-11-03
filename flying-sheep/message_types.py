@@ -688,10 +688,16 @@ class Client(object):
                     # no open connections
                     pass
                 return index, ip, self.active_peers[ip]
+            # no pieces have a peer with an open connection
+            raise ConnectionError('_get_next_piece: { } no open connections'.format(ip))
         else:
             # no open connections
             logging.debug('_get_next_piece: {} piece_cnts: {}  \
             most_common: {}'.format(ip, self.piece_cnts, most_common))
+
+            print('_get_next_piece: {} piece_cnts: {}  \
+            most_common: {}'.format(ip, self.piece_cnts, most_common))
+
             raise ConnectionError('_get_next_piece: { } \
             no open connections'.format(ip))
 
@@ -938,7 +944,7 @@ class Client(object):
                 # send Not Interested msg to peer
                 try:
                     peer.writer.write(NOT_INTERESTED)
-                    process_write_msg(self, peer, bt_messages_by_name['Not Interested'])
+                    self.process_write_msg(peer, bt_messages_by_name['Not Interested'])
                 except Exception as e:
                     print(e.args)
                     raise e
@@ -1297,7 +1303,7 @@ class Client(object):
         # start the piece process
         # interested --> request --> process blocks received --> request -->...
 
-        while self.active_peers and not self.all_pieces():
+        while self.open_peers and not self.all_pieces():
             # not all peers are closed and not all pieces complete
 
             # select a piece_index and a peer
@@ -1308,7 +1314,9 @@ class Client(object):
                 print('connect_to_peer: {} {}'.format(rip, e.args))
                 self._close_peer_connection(rpeer)
             except Exception as e:
-                print(e.args)
+                logging.debug('connect_to_peer: {} {}'.format(rip, e.args))
+                print('connect_to_peer: {} {}'.format(rip, e.args))
+                self._close_peer_connection(rpeer)
 
             # if not interested: write Interested
             if rip in self.channel_state and self.channel_state[rip].open and \
@@ -1342,7 +1350,7 @@ class Client(object):
 
                     except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
                         logging.debug('connect_to_peer: {} expected Unchoke {}'.format(rip, e.args))
-                        print('downloader: {} expected Unchoke {}'.format(rip, e.args))
+                        print('connect_to_peer: {} expected Unchoke {}'.format(rip, e.args))
                         self._close_peer_connection(peer)
                     except Exception as e:
                         logging.debug('connect_to_peer: {} expected Unchoke Other Exception 2 {}'.format(rip, e.args))
