@@ -154,7 +154,7 @@ class PieceBuffer(object):
         if free_row: del piece_index from buffer row; add row to set of available rows
         if not free_row: reset row but keep row in buffer
         """
-        row = self.piece_info[index]['row']
+        row = self.piece_info[piece_index]['row']
         self.buffer[row][:] = bytearray(self.torrent.torrent['info']['piece length'])
         self.piece_info[piece_index]['bitfield'] = self._init_bitfield(piece_index)
         if free_row:
@@ -371,6 +371,7 @@ class Client(object):
         # store last time tracker was contacted
         self.tracker_timer = datetime.datetime.utcnow()
         self.tracker_request_interval = datetime.timedelta(seconds=0)
+        self.selected_piece_peer = [] # [piece_index, peer]
     
     def connect_to_tracker(self, port, numwant=NUMWANT):
         """send GET request; parse self.tracker_response
@@ -679,27 +680,26 @@ class Client(object):
         # [(index, cnt), ..., (index, cnt)]
 
         if most_common:
+            # pieces that client needs
+            # select least common first
             for i in range(1, len(most_common) + 1):
                 index, cnt = most_common[-i]
-                ips = [ip for ip in self.channel_state if self.channel_state[ip].open]
-                try:
+                ips = list(set(self.channel_state.keys()).intersection(self.piece_to_peers[index]))
+                if ips:
+                    # set of open peers with selected piece
                     ip = random.choice(ips)
-                except ValueError as e:
-                    # no open connections
-                    pass
-                return index, ip, self.active_peers[ip]
-            # no pieces have a peer with an open connection
-            raise ConnectionError('_get_next_piece: { } no open connections'.format(ip))
+                    self.selected_piece_peer = [index, self.active_peers[ip]]
+                    return 'success'
+            # no open connections with pieces (all open connections have shut down) 
+            return 'no open connections'
         else:
-            # no open connections
+            # no pieces left in self.piece_cnts
+            print('_get_next_piece: no pieces left in piece_cnts')
             logging.debug('_get_next_piece: {} piece_cnts: {}  \
             most_common: {}'.format(ip, self.piece_cnts, most_common))
-
             print('_get_next_piece: {} piece_cnts: {}  \
             most_common: {}'.format(ip, self.piece_cnts, most_common))
-
-            raise ConnectionError('_get_next_piece: { } \
-            no open connections'.format(ip))
+            return 'need more pieces'
 
     def all_pieces(self):
         return len(self.pbuffer.completed_pieces) == self.torrent.number_pieces
@@ -1303,12 +1303,13 @@ class Client(object):
         # start the piece process
         # interested --> request --> process blocks received --> request -->...
 
-        while self.open_peers and not self.all_pieces():
-            # not all peers are closed and not all pieces complete
+        while self.open_peers and not self.all_pieces() and self.piece_cnts:
+            # not all peers are closed and not all pieces complete and 
+            # peers have pieces that have not completed
 
             # select a piece_index and a peer
             try:
-                rindex, rip, rpeer  = self._get_next_piece()
+                result = self._get_next_piece()
             except ConnectionError as e:
                 logging.debug('connect_to_peer: {} {}'.format(rip, e.args))
                 print('connect_to_peer: {} {}'.format(rip, e.args))
@@ -1317,9 +1318,21 @@ class Client(object):
                 logging.debug('connect_to_peer: {} {}'.format(rip, e.args))
                 print('connect_to_peer: {} {}'.format(rip, e.args))
                 self._close_peer_connection(rpeer)
+            if result == 'success':
+                # piece and peer selected
+                rindex, rpeer = self.selected_piece_peer
+                rip = rpeer.address[0]
+            elif result == 'no open connections':
+                # this should not happen
+                print('connect_to_peer::_get_next_piece: no open connections')
+                yield # continue in loop
+            elif result == 'need more pieces': # self.piece_cnts has been consumed
+                # this should not happen
+                print('connect_to_peer::_get_next_piece: self.piece_cnts have been consumed')
+                yield
 
             # if not interested: write Interested
-            if rip in self.channel_state and self.channel_state[rip].open and \
+            if rip and rip in self.channel_state and self.channel_state[rip].open and \
             not self.bt_state[rip].interested:
                 
                 # write Interested to peer
@@ -1339,7 +1352,7 @@ class Client(object):
                 pass
 
             # if Choked, Read until Unchoked
-            while self.channel_state[rip].open and \
+            while rip and self.channel_state[rip].open and \
                 self.bt_state[rip].choked:
                 if bt_messages[msg_ident] != 'Unchoke':
                     try:
@@ -1367,7 +1380,7 @@ class Client(object):
             # channel is closed or already unchoked
                  
             # write Request and read Piece
-            if self.channel_state[rip].open and \
+            if rip and self.channel_state[rip].open and \
                 not self.bt_state[rip].choked and \
                 rindex not in self.pbuffer.completed_pieces:
                     # write Request
@@ -1409,48 +1422,49 @@ class Client(object):
                             self.bt_state[rip].interested))
                         self._close_peer_connection(rpeer)
 
+                    logging.debug("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
+                    print("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
+
+                    while bt_messages[msg_ident] != 'Piece' and \
+                        self.channel_state[rip].open and \
+                        not self.bt_state[rip].choked:
+                        try:
+                            msg_ident = yield from self.read_peer(rpeer)
+
+                        except (ProtocolError, TimeoutError, OSError) as e:
+                            logging.debug('downloader: {} reading for Piece {}'.format(rip, e.args))
+                            print('downloader: {} reading for Piece {}'.format(rip, e.args))
+                            self._close_peer_connection(rpeer)
+                        except Exception as e:
+                            print(e.args)
+                            logging.debug("downloader: reading for Piece  ip: {} \
+                            channel_state: {} \
+                            open: {} \
+                            choked: {} \
+                            interested: {}"\
+                                .format(rip, \
+                                self.channel_state[rip].state, \
+                                self.channel_state[rip].open,\
+                                self.bt_state[rip].choked, \
+                                self.bt_state[rip].interested))
+                            self._close_peer_connection(rpeer)
+                        finally:
+                            if not self.active_peers:
+                                # no open connections
+                                return
                         logging.debug("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
                         print("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
-
-                        while bt_messages[msg_ident] != 'Piece' and \
-                                self.channel_state[rip].open and \
-                                not self.bt_state[rip].choked:
-                                try:
-                                    msg_ident = yield from self.read_peer(rpeer)
-
-                                except (ProtocolError, TimeoutError, OSError) as e:
-                                    logging.debug('downloader: {} reading for Piece {}'.format(rip, e.args))
-                                    print('downloader: {} reading for Piece {}'.format(rip, e.args))
-                                    self._close_peer_connection(rpeer)
-                                except Exception as e:
-                                    print(e.args)
-                                    logging.debug("downloader: reading for Piece  ip: {} \
-                                    channel_state: {} \
-                                    open: {} \
-                                    choked: {} \
-                                    interested: {}"\
-                                        .format(rip, \
-                                        self.channel_state[rip].state, \
-                                        self.channel_state[rip].open,\
-                                        self.bt_state[rip].choked, \
-                                        self.bt_state[rip].interested))
-                                    self._close_peer_connection(rpeer)
-                                finally:
-                                    if not self.active_peers:
-                                        # no open connections
-                                        return
-                                logging.debug("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
-                                print("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
                         # received Piece msg
                         # top of while loop: if not all_pieces(), get a piece index 
                         # (could be the same as a previous time)
             else:
-                # channel is closed, choked, or piece is complete
-                # top of while loop: if not all_pieces(), get a piece index
+                # channel is closed, choked, or all pieces from peers are complete
+                # top of while loop: if not all_pieces(), and 
+                # peers are open, and have pieces, then get a piece index
                 # (could be the same as a previous time)
                 pass
             
-        # all pieces downloaded
+        # all pieces downloaded or need more peers to get more pieces
         return
                             
                 
