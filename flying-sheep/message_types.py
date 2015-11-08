@@ -137,6 +137,8 @@ class PieceBuffer(object):
             if self._is_piece_hash_good(piece_index):
                 # all bytes received
                 # piece hash matches torrent hash
+                print('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
+                logging.debug('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
                 self.piece_info[piece_index]['hash_verifies'] = True
                 self.completed_pieces.add(piece_index)  # set of piece indices
                 return 'done'
@@ -153,9 +155,11 @@ class PieceBuffer(object):
         reset bitfield to all 0s
         if free_row: del piece_index from buffer row; add row to set of available rows
         if not free_row: reset row but keep row in buffer
-        """
+        """     
         row = self.piece_info[piece_index]['row']
-        self.buffer[row][:] = bytearray(self.torrent.torrent['info']['piece length'])
+
+        #self.buffer[row][:] = array.array('B', bytearray(self.torrent.torrent['info']['piece length']))
+        self.buffer[row] = array.array('B', bytearray(self.torrent.torrent['info']['piece length']))
         self.piece_info[piece_index]['bitfield'] = self._init_bitfield(piece_index)
         if free_row:
             del self.piece_info[piece_index]
@@ -192,6 +196,7 @@ class PieceBuffer(object):
             row = self.piece_info[piece_index]['row']
         except KeyError:
             print("piece index {} is not in buffer".format(piece_index))
+            logging.debug("piece index {} is not in buffer".format(piece_index))
             raise KeyError
         else:
             sha1 = hashlib.sha1()
@@ -799,6 +804,8 @@ class Client(object):
             self.pbuffer.piece_info[index]['offset'] = 0
         elif result == 'bad hash':
             # all blocks received and hash doesn't verify
+            print('rcv_piece_msg: bad hash {}'.format(ip))
+            logging.debug('rcv_piece_msg: bad hash {}'.format(ip))
             self.pbuffer.reset(index)
             # make/send request msg for this piece
             self.pbuffer.piece_info[index]['offset'] = 0
@@ -939,17 +946,12 @@ class Client(object):
         elif ident == 7:
             #  piece message
             peer.timer = datetime.datetime.utcnow()
-            result = self.rcv_piece_msg(msg)
-            if result == 'done':
-                # send Not Interested msg to peer
-                try:
-                    peer.writer.write(NOT_INTERESTED)
-                    self.process_write_msg(peer, bt_messages_by_name['Not Interested'])
-                except Exception as e:
-                    print(e.args)
-                    raise e
-                print('process_read_msg: wrote Not Interested to {}'.format(ip))
-                logging.debug('process_read_msg: wrote Interested to {}'.format(ip))
+            try:
+                result = self.rcv_piece_msg(msg)
+            except BufferFull as e:
+                logging.debug('process_read_msg: BufferFull ip: {}'.format(ip))
+                print('process_read_msg: BufferFull ip: {}'.format(ip))
+                raise e
             pass
         elif ident == 8:
             #  cancel message
@@ -1303,7 +1305,7 @@ class Client(object):
         # start the piece process
         # interested --> request --> process blocks received --> request -->...
 
-        while self.open_peers and not self.all_pieces() and self.piece_cnts:
+        while self.open_peers() and not self.all_pieces() and self.piece_cnts:
             # not all peers are closed and not all pieces complete and 
             # peers have pieces that have not completed
 
