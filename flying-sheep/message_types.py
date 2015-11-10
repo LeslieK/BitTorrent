@@ -141,6 +141,9 @@ class PieceBuffer(object):
                 logging.debug('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
                 self.piece_info[piece_index]['hash_verifies'] = True
                 self.completed_pieces.add(piece_index)  # set of piece indices
+                self.piece_cnts[piece_index] -= 1
+                if self.piece_cnts[piece_index] == 0:
+                    del self. piece_cnts[piece_index]
                 return 'done'
             else:
                 # piece hash does not match torrent match
