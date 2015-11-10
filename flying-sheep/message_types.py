@@ -133,17 +133,16 @@ class PieceBuffer(object):
 
         # check if all blocks received
         if self._is_all_blocks_received(piece_index):
-            self.piece_info[piece_index]['all_blocks_received'] = True
+            
             if self._is_piece_hash_good(piece_index):
                 # all bytes received
+                self.piece_info[piece_index]['all_blocks_received'] = True
                 # piece hash matches torrent hash
                 print('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
                 logging.debug('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
                 self.piece_info[piece_index]['hash_verifies'] = True
                 self.completed_pieces.add(piece_index)  # set of piece indices
-                self.piece_cnts[piece_index] -= 1
-                if self.piece_cnts[piece_index] == 0:
-                    del self. piece_cnts[piece_index]
+                del self. piece_cnts[piece_index]
                 return 'done'
             else:
                 # piece hash does not match torrent match
@@ -157,13 +156,19 @@ class PieceBuffer(object):
         reset buffer row to all 0s
         reset bitfield to all 0s
         if free_row: del piece_index from buffer row; add row to set of available rows
-        if not free_row: reset row but keep row in buffer
+        if free_row == False: 
+            reset row but keep row in buffer
+        if free_row == True: 
+            add row to set of available rows
+            row data is no longer in buffer
         """     
         row = self.piece_info[piece_index]['row']
 
         #self.buffer[row][:] = array.array('B', bytearray(self.torrent.torrent['info']['piece length']))
         self.buffer[row] = array.array('B', bytearray(self.torrent.torrent['info']['piece length']))
         self.piece_info[piece_index]['bitfield'] = self._init_bitfield(piece_index)
+        self.piece_info[piece_index]['offset'] = 0
+        
         if free_row:
             del self.piece_info[piece_index]
             self.free_rows.add(row)  # add row to set of available rows
@@ -204,9 +209,10 @@ class PieceBuffer(object):
         else:
             sha1 = hashlib.sha1()
             if piece_index != self.torrent.LAST_PIECE_INDEX:
-                sha1.update(self.buffer[row][:])
+                sha1.update(self.buffer[row])
             else:
                 last_piece = self.buffer[row][:self.torrent.last_piece_length]
+                assert len(last_piece) == self.torrent.last_piece_length
                 sha1.update(last_piece)
             return sha1.digest()
 
@@ -226,7 +232,7 @@ class PieceBuffer(object):
         """
         init bitfield for a buffer row 
         all bits initialized to 0
-        rightmost bit (LSB): block 
+        rightmost bit (LSB): block 0
         """
         try:
             if piece_index != self.torrent.number_pieces - 1:
@@ -272,9 +278,10 @@ class TorrentWrapper(object):
             self.torrent = bdecode(f)
         self.INFO_HASH = sha1_info(self.torrent)
         self.TRACKER_URL = self.announce()
+        self.total_bytes = self.total_file_length()
         self.piece_length = self.torrent['info']['piece length']
-        self.last_piece_length = self._length_of_last_piece()
         self.number_pieces = self._num_pieces()
+        self.last_piece_length = self._length_of_last_piece()
         self.LAST_PIECE_INDEX = self.number_pieces - 1
 
         self.file_meta = self.file_info()
@@ -295,10 +302,10 @@ class TorrentWrapper(object):
         return hashes[hash_index:hash_index + digest_size]
 
     def _num_pieces(self, digest_size=HASH_DIGEST_SIZE):
-        return math.ceil(self.total_file_length() / self.piece_length)
+        return math.ceil(self.total_bytes / self.piece_length)
 
     def _length_of_last_piece(self):
-        return self.total_file_length() - self.piece_length * (self._num_pieces() - 1)
+        return self.total_bytes - self.piece_length * (self.number_pieces - 1)
 
     def total_file_length(self):
         """returns the number of bytes across all files"""
@@ -356,16 +363,17 @@ class Client(object):
     def __init__(self, torrent):
         self.peer_id = my_peer_id()
         self.torrent = torrent
-        self.tracker_response = {}
-        self.total_files_length = torrent.total_file_length()
-        self.files = self.torrent.file_info()  # list of dicts [{'length': <>, 'name': <>, 'num_pieces': <>}, ...]
+        self.files = self.torrent.file_meta  # list of dicts [{'length': <>, 'name': <>, 'num_pieces': <>}, ...]
+        
+        self.piece_length = self.torrent.piece_length
+        self.last_piece_length = self.torrent.last_piece_length
+        self.total_files_length = self.torrent.total_bytes
+        
         self.num_bytes_uploaded = 0
         self.num_bytes_downloaded = 0
-        self.num_bytes_left = self.total_files_length
-        self.message = ""
+        self.num_bytes_left = self.torrent.total_bytes
         self.bitfield = self.init_bitfield() # sets all bits to 0; piece 0 is leftmost bit (MSB)
-        self.piece_length = self.torrent.torrent['info']['piece length']
-        self.last_piece_length = self._length_of_last_piece()
+
         self.pbuffer = PieceBuffer(torrent)        # PieceBuffer object
         self.buffer = self.pbuffer.buffer          # buffer attrib of PieceBuffer object
         self.output_fds = self.open_files()
@@ -382,6 +390,7 @@ class Client(object):
         self.tracker_timer = datetime.datetime.utcnow()
         self.tracker_request_interval = datetime.timedelta(seconds=0)
         self.selected_piece_peer = [] # [piece_index, peer]
+        self.tracker_response = {}
     
     def connect_to_tracker(self, port, numwant=NUMWANT):
         """send GET request; parse self.tracker_response
@@ -802,9 +811,6 @@ class Client(object):
             self.num_bytes_left -= bytes_in_piece
             # updates self.bitfield
             self.update_bitfield([index])
-            # update self.piece_cnts (Counter of pieces to download)
-            del self.piece_cnts[index]  
-
             # set offset to 0
             self.pbuffer.piece_info[index]['offset'] = 0
         elif result == 'bad hash':
@@ -813,8 +819,8 @@ class Client(object):
             logging.debug('rcv_piece_msg: bad hash index: {}'.format(index))
             self.pbuffer.reset(index)
             # make/send request msg for this piece
-            self.pbuffer.piece_info[index]['offset'] = 0
-        else:
+            
+        elif result == 'not done':
             # not all blocks received
             # increment offset
             self.pbuffer.piece_info[index]['offset'] = begin + length - 9 # lenth of block = length - 9
