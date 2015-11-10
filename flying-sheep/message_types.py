@@ -29,7 +29,7 @@ MAX_PEERS = 50
 BLOCK_SIZE = 16384
 MAX_BLOCK_SIZE = bytes([4, 0, 0, 0]) # 2**14 == 16384
 NUMWANT = 5  # GET parameter to tracker
-BUFFER_SIZE = 5
+BUFFER_SIZE = 12
 CONNECTION_TIMEOUT = datetime.timedelta(seconds=90)
 HANDSHAKE_ID = 100
 KEEPALIVE_ID = 200
@@ -201,9 +201,10 @@ class PieceBuffer(object):
         else:
             sha1 = hashlib.sha1()
             if piece_index != self.torrent.LAST_PIECE_INDEX:
-                sha1.update(self.buffer[row])
+                sha1.update(self.buffer[row][:])
             else:
-                sha1.update(self.buffer[row][:self.torrent.last_piece_length])
+                last_piece = self.buffer[row][:self.torrent.last_piece_length]
+                sha1.update(last_piece)
             return sha1.digest()
 
     def _is_piece_hash_good(self, piece_index):
@@ -230,7 +231,8 @@ class PieceBuffer(object):
             else:
                 number_of_blocks = self.torrent.last_piece_length // BLOCK_SIZE
         except Exception as e:
-            print(e.args) 
+            print('pbuffer._init_bitfield: {}'.format(e.args))
+            logging.debug('pbuffer._init_bitfield: {}'.format(e.args)) 
              
         field = 1 << number_of_blocks
         return field
@@ -804,8 +806,8 @@ class Client(object):
             self.pbuffer.piece_info[index]['offset'] = 0
         elif result == 'bad hash':
             # all blocks received and hash doesn't verify
-            print('rcv_piece_msg: bad hash {}'.format(ip))
-            logging.debug('rcv_piece_msg: bad hash {}'.format(ip))
+            print('rcv_piece_msg: bad hash index: {}'.format(index))
+            logging.debug('rcv_piece_msg: bad hash index: {}'.format(index))
             self.pbuffer.reset(index)
             # make/send request msg for this piece
             self.pbuffer.piece_info[index]['offset'] = 0
@@ -948,9 +950,9 @@ class Client(object):
             peer.timer = datetime.datetime.utcnow()
             try:
                 result = self.rcv_piece_msg(msg)
-            except BufferFull as e:
-                logging.debug('process_read_msg: BufferFull ip: {}'.format(ip))
-                print('process_read_msg: BufferFull ip: {}'.format(ip))
+            except BufferFullError as e:
+                logging.debug('process_read_msg: BufferFullError ip: {}'.format(ip))
+                print('process_read_msg: BufferFullError ip: {}'.format(ip))
                 raise e
             pass
         elif ident == 8:
@@ -1306,8 +1308,9 @@ class Client(object):
         # interested --> request --> process blocks received --> request -->...
 
         while self.open_peers() and not self.all_pieces() and self.piece_cnts:
-            # not all peers are closed and not all pieces complete and 
-            # peers have pieces that have not completed
+            # not all peers are closed and 
+            # not all pieces are complete and 
+            # peers have pieces that client needs
 
             # select a piece_index and a peer
             try:
