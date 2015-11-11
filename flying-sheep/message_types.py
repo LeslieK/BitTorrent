@@ -26,7 +26,7 @@ logging.captureWarnings(capture=True)
 
 DEFAULT_BLOCK_LENGTH = 2**14
 MAX_PEERS = 50
-BLOCK_SIZE = 16384
+BLOCK_SIZE = DEFAULT_BLOCK_LENGTH
 MAX_BLOCK_SIZE = bytes([4, 0, 0, 0]) # 2**14 == 16384
 NUMWANT = 5  # GET parameter to tracker
 BUFFER_SIZE = 12
@@ -91,13 +91,19 @@ class PieceBuffer(object):
     """
     def __init__(self, torrent):
         self.torrent = torrent
-        self.buffer ={row: array.array('B', bytearray(self.torrent.torrent['info']['piece length'])) for row in range(BUFFER_SIZE)}
+
+        self.last_piece_number_blocks = math.ceil(self.torrent.last_piece_length / BLOCK_SIZE)
+        self.last_piece_size_of_last_block = self.torrent.last_piece_length - \
+            (self.last_piece_number_blocks - 1) * BLOCK_SIZE
+
+        self.buffer = {row: array.array('B', \
+            bytearray(self.torrent.torrent['info']['piece length'])) \
+            for row in range(BUFFER_SIZE)}
         self.free_rows = {i for i in range(BUFFER_SIZE)}
         self.completed_pieces = set()  # set of completed pieces (indices); store as a client attribute?
         # {'piece index': 20, 'all_bytes_received': False, 'hash_verifies': False, 'bitfield': 1111100000, 'offset': 0x8000}
         self.piece_info = {}
         
-
     def is_full(self):
         return not self.free_rows  
 
@@ -115,18 +121,24 @@ class PieceBuffer(object):
             self._register_piece(piece_index)
 
         row = self.piece_info[piece_index]['row']
+        
         # insert block of bytes
         ablock = array.array('B', block)
+        self.buffer[row][begin:begin+len(ablock)] = ablock
+
+        # extend row with block; flawed logic: 
+        # can't extend since blocks might arrive out of order
+        # self.buffer[row].extend(ablock)
 
         logging.debug('insert_bytes: length(ablock) = {}, {}'.format(len(ablock), ablock[:5]))
         print('insert_bytes: length(block) = {}, {}'.format(len(ablock), ablock[:5]))
 
-        self.buffer[row][begin:begin+len(ablock)] = ablock
+        logging.debug('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
+            .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
+        print('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
+            .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
 
-        logging.debug('insert_bytes: PieceBuffer buffer[{}] begin: {}'
-            .format(row, begin))
-        print('insert_bytes: PieceBuffer buffer[{}] begin: {}'
-            .format(row, begin))
+        assert self.buffer[row][begin:begin+len(ablock)] == ablock
 
         # update bitfield (each bit represents a block in the piece)
         self._update_bitfield(piece_index)
@@ -142,7 +154,6 @@ class PieceBuffer(object):
                 logging.debug('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
                 self.piece_info[piece_index]['hash_verifies'] = True
                 self.completed_pieces.add(piece_index)  # set of piece indices
-                del self. piece_cnts[piece_index]
                 return 'done'
             else:
                 # piece hash does not match torrent match
@@ -153,7 +164,7 @@ class PieceBuffer(object):
 
     def reset(self, piece_index, free_row=False):
         """
-        reset buffer row to all 0s
+        reset buffer row to bytearray()
         reset bitfield to all 0s
         if free_row: del piece_index from buffer row; add row to set of available rows
         if free_row == False: 
@@ -164,8 +175,8 @@ class PieceBuffer(object):
         """     
         row = self.piece_info[piece_index]['row']
 
-        #self.buffer[row][:] = array.array('B', bytearray(self.torrent.torrent['info']['piece length']))
-        self.buffer[row] = array.array('B', bytearray(self.torrent.torrent['info']['piece length']))
+        self.buffer[row] = array.array('B', bytearray(self.torrent.piece_length))
+        #self.buffer[row] = array.array('B', bytearray()); cannot extend array with array('B', block)
         self.piece_info[piece_index]['bitfield'] = self._init_bitfield(piece_index)
         self.piece_info[piece_index]['offset'] = 0
         
@@ -200,25 +211,34 @@ class PieceBuffer(object):
 
     def _sha1_hash(self, piece_index):
         """hash the piece bytes"""
+        sha1 = hashlib.sha1()
         try:
             row = self.piece_info[piece_index]['row']
         except KeyError:
             print("piece index {} is not in buffer".format(piece_index))
             logging.debug("piece index {} is not in buffer".format(piece_index))
             raise KeyError
+
+        if piece_index != self.torrent.LAST_PIECE_INDEX:
+            piece = self.buffer[row]
+            assert piece == self.buffer[row]
         else:
-            sha1 = hashlib.sha1()
-            if piece_index != self.torrent.LAST_PIECE_INDEX:
-                sha1.update(self.buffer[row])
-            else:
-                last_piece = self.buffer[row][:self.torrent.last_piece_length]
-                assert len(last_piece) == self.torrent.last_piece_length
-                sha1.update(last_piece)
-            return sha1.digest()
+            piece = self.buffer[row][:self.torrent.last_piece_length]
+            assert piece == self.buffer[row][:self.torrent.last_piece_length]
+
+        print('_sha1_hash: piece_index: {} bytes: {} {}'\
+            .format(piece_index, piece[:10], piece[:-5:-1]))
+        logging.debug('_sha1_hash: piece_index: {} bytes: {} {}'\
+            .format(piece_index, piece[:10], piece[:-5:-1]))
+        sha1.update(piece)
+        return sha1.digest()
 
     def _is_piece_hash_good(self, piece_index):
         torrent_hash_value = self.torrent.get_hash(piece_index)
         piece_hash_value = self._sha1_hash(piece_index)
+        print(torrent_hash_value[:10])
+        print(piece_hash_value[:10])
+
         return torrent_hash_value == piece_hash_value
        
     def _is_all_blocks_received(self, piece_index):
@@ -226,6 +246,8 @@ class PieceBuffer(object):
         returns True if bitfield has no "0"
         """
         bf = bin(self.piece_info[piece_index]['bitfield'])[3:]
+        print('_is_all_blocks_received: blocks bitfield: {}'.format(bf))
+        logging.debug('_is_all_blocks_received: blocks bitfield: {}'.format(bf))
         return not('0' in bf)
 
     def _init_bitfield(self, piece_index):
@@ -235,13 +257,14 @@ class PieceBuffer(object):
         rightmost bit (LSB): block 0
         """
         try:
-            if piece_index != self.torrent.number_pieces - 1:
-                number_of_blocks = self.torrent.piece_length // BLOCK_SIZE 
+            if piece_index != self.torrent.LAST_PIECE_INDEX:
+                number_of_blocks = math.ceil(self.torrent.piece_length / BLOCK_SIZE) 
             else:
-                number_of_blocks = self.torrent.last_piece_length // BLOCK_SIZE
+                number_of_blocks = math.ceil(self.torrent.last_piece_length / BLOCK_SIZE)
         except Exception as e:
             print('pbuffer._init_bitfield: {}'.format(e.args))
-            logging.debug('pbuffer._init_bitfield: {}'.format(e.args)) 
+            logging.debug('pbuffer._init_bitfield: {}'.format(e.args))
+            raise e 
              
         field = 1 << number_of_blocks
         return field
@@ -256,8 +279,10 @@ class PieceBuffer(object):
 
         bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
         length = len(bfs)
-        logging.debug('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
-        print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
+        logging.debug('_update_bitfield (pbuffer): {} block number: {}'\
+            .format(bfs[length-1-block_number], block_number))
+        print('_update_bitfield (pbuffer): {} block number: {}'\
+            .format(bfs[length-1-block_number], block_number))
 
         self.piece_info[piece_index]['bitfield'] |= 1 << block_number
 
@@ -363,12 +388,17 @@ class Client(object):
     def __init__(self, torrent):
         self.peer_id = my_peer_id()
         self.torrent = torrent
-        self.files = self.torrent.file_meta  # list of dicts [{'length': <>, 'name': <>, 'num_pieces': <>}, ...]
+        # list of dicts [{'length': <>, 'name': <>, 'num_pieces': <>}, ...]
+        self.files = self.torrent.file_meta  
         
+        self.total_files_length = self.torrent.total_bytes
         self.piece_length = self.torrent.piece_length
         self.last_piece_length = self.torrent.last_piece_length
-        self.total_files_length = self.torrent.total_bytes
-        
+
+        self.last_piece_number_blocks = math.ceil(self.torrent.last_piece_length / BLOCK_SIZE)
+        self.last_piece_size_of_last_block = self.torrent.last_piece_length - \
+            (self.last_piece_number_blocks - 1) * BLOCK_SIZE
+ 
         self.num_bytes_uploaded = 0
         self.num_bytes_downloaded = 0
         self.num_bytes_left = self.torrent.total_bytes
@@ -655,7 +685,15 @@ class Client(object):
         return bytes(buf)
 
     def make_request_msg(self, piece_index, begin_offset, block_len=DEFAULT_BLOCK_LENGTH):
-        """only send request to a peer that has piece_index"""
+        """only send request to a peer that has piece_index
+        
+        last block of last piece must be calculated; it is not the default
+        """
+
+        if piece_index == self.torrent.LAST_PIECE_INDEX:
+            if begin_offset // BLOCK_SIZE == self.last_piece_number_blocks - 1:
+                # last block of last piece
+                block_len = self.last_piece_size_of_last_block
 
         length = b'\x00\x00\x00\x0d' # 13
         ident = b'\x06'
@@ -702,7 +740,8 @@ class Client(object):
             # pieces that client needs
             # select least common first
             for i in range(1, len(most_common) + 1):
-                index, cnt = most_common[-i]
+                index, cnt = most_common[-i] # the real code
+                #index, cnt = most_common[i]  # for testing purposes
                 ips = list(set(self.channel_state.keys()).intersection(self.piece_to_peers[index]))
                 if ips:
                     # set of open peers with selected piece
@@ -737,11 +776,13 @@ class Client(object):
         msgd['length'] = self._4bytes_to_int(buf[:4])
         msgd['id'] = buf[4]
         msgd['piece index'] = self._4bytes_to_int(buf[5:9])
+        index = msgd['piece index']
         # update data structures
-        self.active_peers[ip].has_pieces.add(msgd['piece index'])
-        self.piece_to_peers[msgd['piece index']].add(ip)
+        self.active_peers[ip].has_pieces.add(index)
+        self.piece_to_peers[index].add(ip)
         #self.peer_to_pieces[ip].add(msgd['piece index'])
-        self.piece_cnts[msgd['piece index']] += 1
+        if index not in self.pbuffer.completed_pieces:
+            self.piece_cnts[index] += 1
         return msgd
 
     def rcv_bitfield_msg(self, ip, buf):
@@ -757,10 +798,11 @@ class Client(object):
         self.active_peers[ip].bitfield = msgd['bitfield']
         self.active_peers[ip].has_pieces = self.get_indices(msgd['bitfield'])
         # update data structures
-        for piece in self.active_peers[ip].has_pieces:
-            self.piece_to_peers[piece].add(ip)
-            #self.peer_to_pieces[ip].add(piece)
-            self.piece_cnts[piece] += 1
+        for index in self.active_peers[ip].has_pieces:
+            self.piece_to_peers[index].add(ip)
+            #self.peer_to_pieces[ip].add(index)
+            if index not in self.pbuffer.completed_pieces:
+                self.piece_cnts[index] += 1
         return msgd
 
     def rcv_request_msg(self, buf):
@@ -811,6 +853,8 @@ class Client(object):
             self.num_bytes_left -= bytes_in_piece
             # updates self.bitfield
             self.update_bitfield([index])
+            # del piece from piece_cnts since piece is no longer needed
+            del self.piece_cnts[index]
             # set offset to 0
             self.pbuffer.piece_info[index]['offset'] = 0
         elif result == 'bad hash':
@@ -1297,7 +1341,7 @@ class Client(object):
             except Exception as e:
                 print(e.args)
                 logging.debug('connect_to_peer:  {}: reading bitfield/have {}'.format(ip, e.args))
-                print('connect_to_peer:  {}: error in reading {}'.format(ip, msg_ident))
+                print('connect_to_peer:  {}: error in reading {}'.format(ip, bt_messages[msg_ident]))
                 self._close_peer_connection(peer)
             
             logging.debug("connect_to_peer: {}: successfully read {}".format(ip, bt_messages[msg_ident]))
@@ -1317,9 +1361,9 @@ class Client(object):
         # interested --> request --> process blocks received --> request -->...
 
         while self.open_peers() and not self.all_pieces() and self.piece_cnts:
-            # not all peers are closed and 
+            # at least 1 peer is open and 
             # not all pieces are complete and 
-            # peers have pieces that client needs
+            # open peer(s) may have pieces that client needs
 
             # select a piece_index and a peer
             try:
@@ -1368,7 +1412,7 @@ class Client(object):
             # if Choked, Read until Unchoked
             while rip and self.channel_state[rip].open and \
                 self.bt_state[rip].choked:
-                if bt_messages[msg_ident] != 'Unchoke':
+                if msg_ident and bt_messages[msg_ident] != 'Unchoke':
                     try:
                         logging.info("{}: client ready to receive Unchoke".format(rip))
                         print("{}: client ready to receive Unchoke".format(rip))
@@ -1387,10 +1431,30 @@ class Client(object):
                         if not self.active_peers:
                             # close Task so loop stops and program can reconnect to Tracker 
                             return
-                    logging.debug("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
+                    logging.debug("connect_to_peer: {}: received {}".format(rip, bt_messages[msg_ident]))
+                elif not msg_ident:
+                    try:
+                        logging.info("{}: client ready to receive Unchoke".format(rip))
+                        print("{}: client ready to receive Unchoke".format(rip))
+
+                        msg_ident = yield from self.read_peer(peer) # read and process
+
+                    except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
+                        logging.debug('connect_to_peer: {} expected Unchoke {}'.format(rip, e.args))
+                        print('connect_to_peer: {} expected Unchoke {}'.format(rip, e.args))
+                        self._close_peer_connection(peer)
+                    except Exception as e:
+                        logging.debug('connect_to_peer: {} expected Unchoke Other Exception 2 {}'.format(rip, e.args))
+                        print('connect_to_peer: {} expected Unchoke {}'.format(rip, e.args))
+                        self._close_peer_connection(peer)
+                    finally:
+                        if not self.active_peers:
+                            # close Task so loop stops and program can reconnect to Tracker 
+                            return
+                    logging.debug("connect_to_peer: {}: received {}".format(rip, bt_messages[msg_ident]))
                 else:
                     # received Unchoke
-                    pass
+                    break
             # channel is closed or already unchoked
                  
             # write Request and read Piece
@@ -1436,8 +1500,8 @@ class Client(object):
                             self.bt_state[rip].interested))
                         self._close_peer_connection(rpeer)
 
-                    logging.debug("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
-                    print("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
+                    logging.debug("connect_to_peer: {}: to read {}".format(rip, bt_messages[msg_ident]))
+                    print("connect_to_peer: {}: to read {}".format(rip, bt_messages[msg_ident]))
 
                     while bt_messages[msg_ident] != 'Piece' and \
                         self.channel_state[rip].open and \
@@ -1529,7 +1593,7 @@ class Client(object):
 
             except Exception as e:
                 logging.debug('read_peer {}: read Handshake error {}'.format(ip, e.args))
-                raise ProtocolError from Exception
+                raise ProtocolError from e
             else:
                 logging.info('read_peer: Received Handshake from {}'.format(ip))
                 msg_ident = HANDSHAKE_ID
