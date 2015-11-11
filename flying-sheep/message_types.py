@@ -91,11 +91,6 @@ class PieceBuffer(object):
     """
     def __init__(self, torrent):
         self.torrent = torrent
-
-        self.last_piece_number_blocks = math.ceil(self.torrent.last_piece_length / BLOCK_SIZE)
-        self.last_piece_size_of_last_block = self.torrent.last_piece_length - \
-            (self.last_piece_number_blocks - 1) * BLOCK_SIZE
-
         self.buffer = {row: array.array('B', \
             bytearray(self.torrent.torrent['info']['piece length'])) \
             for row in range(BUFFER_SIZE)}
@@ -221,10 +216,8 @@ class PieceBuffer(object):
 
         if piece_index != self.torrent.LAST_PIECE_INDEX:
             piece = self.buffer[row]
-            assert piece == self.buffer[row]
         else:
             piece = self.buffer[row][:self.torrent.last_piece_length]
-            assert piece == self.buffer[row][:self.torrent.last_piece_length]
 
         print('_sha1_hash: piece_index: {} bytes: {} {}'\
             .format(piece_index, piece[:10], piece[:-5:-1]))
@@ -238,7 +231,6 @@ class PieceBuffer(object):
         piece_hash_value = self._sha1_hash(piece_index)
         print(torrent_hash_value[:10])
         print(piece_hash_value[:10])
-
         return torrent_hash_value == piece_hash_value
        
     def _is_all_blocks_received(self, piece_index):
