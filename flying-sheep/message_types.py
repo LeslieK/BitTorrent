@@ -413,10 +413,45 @@ class Client(object):
         self.tracker_request_interval = datetime.timedelta(seconds=0)
         self.selected_piece_peer = [] # [piece_index, peer]
         self.tracker_response = {}
+        self.TRACKER_EVENT = 'started'
+
+    def shutdown(self):
+        """
+        shutdown each open peer
+        """
+        # shutdown client
+        print('client is shutting down...')
+        logging.debug('client is shutting down...')
+
+        success = all([self._close_peer_connection(peer) for ip, peer in self.open_peers().items()])
+        if success:
+            # successfully closed all open peers
+            try:
+                self.TRACKER_EVENT = 'stopped'
+                r = self.connect_to_tracker(PORTS[0], numwant=0, completed=True)
+            except Exception as e:
+                print('client shutdown error: {}'.format(e.args))
+                logging.debug('client shutdown error: {}'.format(e.args))
+            print('client completed shutdown')
+            logging.debug('client completed shutdown')
+            return True
+        else:
+            # client did not close all open peers
+            print('client shutdown failed')
+            logging.debug('client shutdown failed')
+            return False
     
-    def connect_to_tracker(self, port, numwant=NUMWANT):
+    def connect_to_tracker(self, port, numwant=NUMWANT, completed=False):
         """send GET request; parse self.tracker_response
         
+        event = 'started' on first request to connect
+        event = 'stopped' when client shuts down gracefully
+        event = 'completed' when download completes
+        event = not specified, otherwise
+
+        completed = False: all pieces have not been downloaded
+        completed = True: all pieces downloaded
+
         resets client's tracker interval timer"""
 
         http_get_params = {
@@ -430,18 +465,30 @@ class Client(object):
             'numwant': numwant
             }
 
+        print('connect_to_tracker: self.TRACKER_EVENT: {}'.format(self.TRACKER_EVENT))
+        logging.debug('connect_to_tracker: self.TRACKER_EVENT: {}'.format(self.TRACKER_EVENT))
+
         # blocking
-        r = requests.get(self.torrent.TRACKER_URL, params=http_get_params)
+        if self.TRACKER_EVENT:
+            http_get_params['event'] = self.TRACKER_EVENT
+            r = requests.get(self.torrent.TRACKER_URL, params=http_get_params)
+            self.TRACKER_EVENT = None
+        else:
+            r = requests.get(self.torrent.TRACKER_URL, params=http_get_params)
 
         # reset client's tracker timer
         self.tracker_timer = datetime.datetime.utcnow()
 
-        tracker_resp = r.content
-        self.tracker_response = bdecode(tracker_resp)
-        success = self._parse_tracker_response()
-        logging.debug('{}: parsed tracker response'.format(success))
-        print('{}: parsed tracker response'.format(success))
-        return success
+        if not completed:
+            tracker_resp = r.content
+            try:
+                self.tracker_response = bdecode(tracker_resp)
+            except Exception as e:
+                print(e.args)
+            success = self._parse_tracker_response()
+            logging.debug('{}: parsed tracker response'.format(success))
+            print('{}: parsed tracker response'.format(success))
+            return success
 
     def _parse_tracker_response(self):
         """parses tracker response
@@ -854,7 +901,6 @@ class Client(object):
             print('rcv_piece_msg: bad hash index: {}'.format(index))
             logging.debug('rcv_piece_msg: bad hash index: {}'.format(index))
             self.pbuffer.reset(index)
-            # make/send request msg for this piece
             
         elif result == 'not done':
             # not all blocks received
@@ -876,37 +922,37 @@ class Client(object):
         
         try:
             assert buf[1:20].decode() == 'BitTorrent protocol'
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as e:
            pass
-        except AssertionError:
+        except AssertionError as e:
             pass
         else:
             try:
                 assert buf[0] == 19
             except AssertionError:
                 raise ConnectionError("received handshake msg with length {}; should be 19".format(buf[0].decode()))
+            
+            #  handshake message
+            msgd = self.rcv_handshake_msg(buf)
+            try:
+                # check info_hash
+                assert msgd['info_hash'] == self.torrent.INFO_HASH
+            except AssertionError:
+                raise ConnectionError("peer is not part of torrent: expected hash: {}"\
+                    .format(self.torrent.INFO_HASH))
+
+            # check protocol
+            if self.channel_state[ip].state == 1:
+                self.channel_state[ip].state = 2
             else:
-                #  handshake messaage
-                msgd = self.rcv_handshake_msg(buf)
-                try:
-                    # check info_hash
-                    assert msgd['info_hash'] == self.torrent.INFO_HASH
-                except AssertionError:
-                    raise ConnectionError("peer is not part of torrent: expected hash: {}"\
-                        .format(self.torrent.INFO_HASH))
-                else:
-                    # check protocol
-                    if self.channel_state[ip].state == 1:
-                        self.channel_state[ip].state = 2
-                    else:
-                        raise ProtocolError("expected Handshake in state 1; \
-                        received in state {}".format(self.channel_state[ip].state))
-                # set peer_id of peer
-                peer.peer_id = msgd['peer_id']
-                # reset peer timer
-                peer.timer = datetime.datetime.utcnow()
-                ident = HANDSHAKE_ID  # identifies handshake
-                return ident
+                raise ProtocolError("expected Handshake in state 1; \
+                received in state {}".format(self.channel_state[ip].state))
+            # set peer_id of peer
+            peer.peer_id = msgd['peer_id']
+            # reset peer timer
+            peer.timer = datetime.datetime.utcnow()
+            ident = HANDSHAKE_ID  # identifies handshake
+            return ident
 
         ident = buf[4]
 
@@ -917,7 +963,7 @@ class Client(object):
                 assert length == 1
             except AssertionError:
                 raise ConnectionError("Choke: bad length  received: {} expected: 1"\
-                                      .format(length))
+                                        .format(length))
             peer.timer = datetime.datetime.utcnow()
             self.bt_state[ip].choked = 1  # peer choked client
             if self.channel_state[ip].state == 30:
@@ -936,7 +982,7 @@ class Client(object):
                 assert length == 1
             except AssertionError:
                 raise ConnectionError("Unchoke: bad length  received: {} expected: 1"\
-                                      .format(length))
+                                        .format(length))
             peer.timer = datetime.datetime.utcnow()
             self.bt_state[ip].choked = 0  # peer unchoked client
             if self.channel_state[ip].state == 3:
@@ -952,7 +998,7 @@ class Client(object):
                 assert length == 1
             except AssertionError:
                 raise ConnectionError("Interested: bad length  received: {} expected: 1"\
-                                      .format(length))
+                                        .format(length))
             peer.timer = datetime.datetime.utcnow()
             peer.bt_state.interested = 1  # peer is interested in client
         elif ident == 3:
@@ -962,7 +1008,7 @@ class Client(object):
                 assert length == 1
             except AssertionError:
                 raise ConnectionError("Not Interested: bad length  received: {} expected: 1"\
-                                      .format(length))
+                                        .format(length))
             peer.timer = datetime.datetime.utcnow()
             peer.bt_state.interested = 0  # peer is not interested in client
         elif ident == 4:
@@ -982,9 +1028,17 @@ class Client(object):
             except AssertionError:
                 raise ProtocolError(
                     'Bitfield received in state {}. Did not follow Handshake.'\
-                     .format(self.channel_state[ip].state))
+                        .format(self.channel_state[ip].state))
             peer.timer = datetime.datetime.utcnow()
             msgd = self.rcv_bitfield_msg(ip, buf)  # set peer's bitfield
+            try:
+                bitfield = msgd['bitfield']  # bytearray
+                number_padding_bits = 8 - self.torrent.number_pieces % 8
+                assert (bitfield[-1] >> number_padding_bits) < 2**number_padding_bits
+            except AssertionError:
+                raise ProtocolError(
+                    'Bitfield has at least one 1 in rightmost {} (padding) bits'\
+                        .format(number_padding_bits))
             self.channel_state[ip].state = 4
         elif ident == 6:
             #  request message
@@ -1680,7 +1734,17 @@ if __name__ == "__main__":
                 loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive))
             except KeyboardInterrupt as e:
                 print(e.args)
-                loop.stop()
+                client.shutdown()
+            except Exception as e:
+                print(e.args)
+                client.shutdown()
+
+    # download complete
+    client.TRACKER_EVENT='completed'
+    client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
+
+    # client shutdown
+    client.shutdown()
 
     loop.close()
 
