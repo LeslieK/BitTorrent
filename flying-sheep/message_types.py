@@ -574,6 +574,7 @@ class Client(object):
         self.channel_state[ip].open = 1
         self.channel_state[ip].state = 1
         logging.debug('write Handshake to {}'.format(ip))
+        print('write Handshake to {}'.format(ip))
         peer.writer.write(self.HANDSHAKE)
         self.reset_keepalive(peer)
 
@@ -713,8 +714,8 @@ class Client(object):
         """
         client makes msg after it downloads piece_index and it verifies hash
         """
-        length = self._int_to_4bytes(5)
-        ident = b'4'
+        length = bytes([0, 0, 0, 5])
+        ident = bytes([4])
         return length + ident + self._int_to_4bytes(piece_index)
 
     def make_cancel_msg(self, request_msg):
@@ -897,7 +898,22 @@ class Client(object):
             self.pbuffer.piece_info[index]['offset'] = 0
 
             # just received all the blocks for a piece
-            pass
+            # send Have message to all open peers that don't have piece
+            msg = self.make_have_msg(index)
+            open_connections = self.open_peers()
+            if open_connections:
+                #list_peers = [(ipx, peerx) for ipx, peerx in open_connections.items() if not peerx.has_piece(index)]
+                #for iph, peerh in list_peers:
+                #    try:
+                #        peerh.writer.write(msg)
+                #        yield from peerh.writer.drain()
+                #    except Exception as e:
+                #        logging.debug('rcv_piece_msg::done error in writing Have to {}'.format(iph))
+                #        print('rcv_piece_msg::done error in writing Have to {}'.format(iph))
+                #        raise e
+                #    print('rcv_piece_msg::done wrote Have msg to {}'.format(iph))
+                #    logging.debug('rcv_piece_msg::done wrote Have msg to {}'.format(iph))
+                pass
 
         elif result == 'bad hash':
             # all blocks received and hash doesn't verify
@@ -1041,7 +1057,7 @@ class Client(object):
             try:
                 bitfield = msgd['bitfield']  # bytearray
                 number_padding_bits = 8 - self.torrent.number_pieces % 8
-                assert (bitfield[-1] >> number_padding_bits) < 2**number_padding_bits
+                assert bitfield[-1] >> number_padding_bits << number_padding_bits == bitfield[-1]
             except AssertionError:
                 raise ProtocolError(
                     'Bitfield has at least one 1 in rightmost {} (padding) bits'\
@@ -1059,6 +1075,9 @@ class Client(object):
             except BufferFullError as e:
                 logging.debug('process_read_msg: BufferFullError ip: {}'.format(ip))
                 print('process_read_msg: BufferFullError ip: {}'.format(ip))
+                raise e
+            except Exception as e:
+                print(e.args)
                 raise e
             pass
         elif ident == 8:
@@ -1156,6 +1175,16 @@ class Client(object):
             peer._client_keepalive_timer = datetime.datetime.utcnow()
             logging.debug('wrote KEEPALIVE to {}'.format(peer.address[0]))
             print('wrote KEEPALIVE to {}'.format(peer.address[0]))
+
+    @asyncio.coroutine
+    def connect_from_peer(self, peer):
+        """
+        peer initiates handshake
+        client responds with handshake to peer
+        send bitfield
+
+        """
+        pass
           
     @asyncio.coroutine
     def connect_to_peer(self, peer):
@@ -1337,8 +1366,10 @@ class Client(object):
                     
                     try:
                         peer.writer.write(msg)
+                        yield from peer.writer.drain()
                     except Exception as e:
-                        print('connect_to_peer: {} try write request'.format(rip, e.args))
+                        print('connect_to_peer: {} write Request error'.format(rip, e.args))
+                        print('connect_to_peer: {} write Request error'.format(rip, e.args))
                         self._close_peer_connection(rpeer)
                     
                     self.process_write_msg(rpeer, bt_messages_by_name['Request'])
@@ -1368,8 +1399,8 @@ class Client(object):
                             self.bt_state[rip].interested))
                         self._close_peer_connection(rpeer)
 
-                    logging.debug("connect_to_peer: {}: to read {}".format(rip, bt_messages[msg_ident]))
-                    print("connect_to_peer: {}: to read {}".format(rip, bt_messages[msg_ident]))
+                    logging.debug("connect_to_peer: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
+                    print("connect_to_peer: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
 
                     while bt_messages[msg_ident] != 'Piece' and \
                         self.channel_state[rip].open and \
@@ -1398,11 +1429,11 @@ class Client(object):
                             if not self.active_peers:
                                 # no open connections
                                 return
-                        logging.debug("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
-                        print("connect_to_peer: {}: read {}".format(rip, bt_messages[msg_ident]))
-                        # received Piece msg
-                        # top of while loop: if not all_pieces(), get a piece index 
-                        # (could be the same as a previous time)
+                        logging.debug("connect_to_peer: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
+                        print("connect_to_peer: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
+                    # received Piece msg or Choke msg or Exception (if exception: client closes connection to rip)
+                    # top of while loop: if not all_pieces(), get a piece index 
+                    # (could be the same as a previous time)
             else:
                 # channel is closed, choked, or all pieces from peers are complete
                 # top of while loop: if not all_pieces(), and 
@@ -1411,6 +1442,16 @@ class Client(object):
                 pass
             
         # all pieces downloaded or need more peers to get more pieces
+        # for each open peer (if any): reset Interested to Not Interested
+        for ipx in self.bt_state:
+            try:
+                peerx = self.active_peers[ipx]
+                peerx.writer.write(NOT_INTERESTED)
+            except Exception as e:
+                logging.debug('connect_to_peer: {} error in writing Not Interested'.format(ipx))
+                print('connect_to_peer: {} error in writing Not Interested'.format(ipx))
+                self._close_peer_connection(peerx)
+            self.bt_state[ipx].interested=0
         return
                             
                 
@@ -1458,12 +1499,12 @@ class Client(object):
             except ConnectionError as e:
                 print('read_peer {}: {}'.format(ip, e.args))
                 logging.debug('read_peer {}: {}'.format(ip, e.args))
-                raise ConnectionError
+                raise e
 
             except Exception as e:
                 print('read_peer {}: read Handshake error {}'.format(ip, e.args))
                 logging.debug('read_peer {}: read Handshake error {}'.format(ip, e.args))
-                raise ProtocolError from e
+                raise e
 
             logging.info('read_peer: Received Handshake from {}'.format(ip))
             msg_ident = HANDSHAKE_ID
@@ -1491,7 +1532,7 @@ class Client(object):
                 except (ProtocolError, TimeoutError, OSError) as e:
                     logging.debug("read_peer {}: caught error from body {}".format(ip, e.args))
                     print("read_peer {}: caught error from body {}".format(ip, e.args))
-                    raise
+                    raise e
                 except Exception as e:
                     logging.debug("read_peer {}: caught Other Exception {}".format(ip, e.args))
                     print("read_peer {}: caught error from body {}".format(ip, e.args))
@@ -1529,7 +1570,14 @@ class Peer(object):
         # peer keepalive timer (reset when client receives msg from peer)
         self._timer = datetime.datetime.utcnow() 
         # client keepalive timer (reset when client sends msg to peer)
-        self._client_keepalive_timer = datetime.datetime.utcnow() 
+        self._client_keepalive_timer = datetime.datetime.utcnow()
+        
+    def has_piece(self, piece_index):
+        """
+        True if peer has piece
+        False otherwise
+        """
+        return piece_index in self.has_pieces 
 
 
 ########## 
@@ -1563,9 +1611,11 @@ if __name__ == "__main__":
             except KeyboardInterrupt as e:
                 print(e.args)
                 client.shutdown()
+                raise e
             except Exception as e:
                 print(e.args)
                 client.shutdown()
+                raise e
 
     # download complete
     client.TRACKER_EVENT='completed'
