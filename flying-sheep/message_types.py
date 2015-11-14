@@ -734,7 +734,7 @@ class Client(object):
                 # last block of last piece
                 block_len = self.last_piece_size_of_last_block
 
-        length = b'\x00\x00\x00\x0d' # 13
+        length = b'\x00\x00\x00\x0d' # 13 bytes([0, 0, 0, 13])
         ident = b'\x06'
         index = self._int_to_4bytes(piece_index)
         begin = self._int_to_4bytes(begin_offset)
@@ -899,21 +899,14 @@ class Client(object):
 
             # just received all the blocks for a piece
             # send Have message to all open peers that don't have piece
-            msg = self.make_have_msg(index)
-            open_connections = self.open_peers()
-            if open_connections:
-                #list_peers = [(ipx, peerx) for ipx, peerx in open_connections.items() if not peerx.has_piece(index)]
-                #for iph, peerh in list_peers:
-                #    try:
-                #        peerh.writer.write(msg)
-                #        yield from peerh.writer.drain()
-                #    except Exception as e:
-                #        logging.debug('rcv_piece_msg::done error in writing Have to {}'.format(iph))
-                #        print('rcv_piece_msg::done error in writing Have to {}'.format(iph))
-                #        raise e
-                #    print('rcv_piece_msg::done wrote Have msg to {}'.format(iph))
-                #    logging.debug('rcv_piece_msg::done wrote Have msg to {}'.format(iph))
-                pass
+            try:
+                self.send_have_msg(index)
+                #msg = self.make_have_msg(index)
+                #for ipx, peerx in self.open_peers().items():
+                #    peerx.writer.write(msg)
+            except Exception as e:
+                raise e
+            
 
         elif result == 'bad hash':
             # all blocks received and hash doesn't verify
@@ -926,6 +919,24 @@ class Client(object):
             # increment offset
             self.pbuffer.piece_info[index]['offset'] = begin + length - 9 # lenth of block = length - 9
         return result
+
+    def send_have_msg(self, piece_index):
+        msg = self.make_have_msg(piece_index)
+        for ipx, peerx in self.open_peers().items():
+            if not peerx.has_piece(piece_index):
+                try:
+                    peerx.writer.write(msg)
+                    #yield from peerx.writer.drain()  # don't understand why this doesn't work
+                except Exception as e:
+                    print(e.args)
+                    logging.debug('rcv_piece_msg::done error in writing Have to {}'.format(ipx))
+                    print('rcv_piece_msg::done error in writing Have to {}'.format(ipx))
+                    raise e
+                print('rcv_piece_msg::done successfully wrote Have msg to {}'.format(ipx))
+                logging.debug('rcv_piece_msg::done successfully wrote Have msg to {}'.format(ipx))
+            else:
+                # peer already has piece
+                pass
 
     def process_read_msg(self, peer, msg):
         """process incoming msg from peer - protocol state machine
@@ -1447,10 +1458,13 @@ class Client(object):
             try:
                 peerx = self.active_peers[ipx]
                 peerx.writer.write(NOT_INTERESTED)
+                yield from peerx.writer.drain()
             except Exception as e:
                 logging.debug('connect_to_peer: {} error in writing Not Interested'.format(ipx))
                 print('connect_to_peer: {} error in writing Not Interested'.format(ipx))
                 self._close_peer_connection(peerx)
+            print('connect_to_peer: successfully wrote Not Interested to {}'.format(ipx))
+            logging.debug('connect_to_peer: successfully wrote Not Interested to {}'.format(ipx))
             self.bt_state[ipx].interested=0
         return
                             
