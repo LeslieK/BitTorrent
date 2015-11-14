@@ -977,6 +977,8 @@ class Client(object):
                 self.channel_state[ip].state = 5
             elif self.channel_state[ip].state == 9:
                 self.channel_state[ip].state = 10
+            elif self.channel_state[ip].state == 50:
+                self.channel_state[ip].state = 4
 
         elif ident == 1:
             #  unchoke message
@@ -1476,7 +1478,8 @@ class Client(object):
             except Exception as e:
                 logging.debug("read_peer {}: caught Other Exception 2:  {}".format(ip, e.args))
                 #if reader._transport_.conn_lost:
-                raise reader.exception()
+                #raise reader.exception()
+                raise e
             if msg_length == KEEPALIVE:
                 peer.timer = datetime.datetime.utcnow()
                 print('read_peer: received Keep-Alive from peer {}'.format(ip))
@@ -1492,7 +1495,8 @@ class Client(object):
                 except Exception as e:
                     logging.debug("read_peer {}: caught Other Exception {}".format(ip, e.args))
                     print("read_peer {}: caught error from body {}".format(ip, e.args))
-                    raise reader.exception()
+                    #raise reader.exception()
+                    raise e
                 msg_ident = msg_body[0]
                 if msg_ident in list(range(10)) or msg_ident == KEEPALIVE_ID:
                     # processing the read msg happens here
