@@ -1,7 +1,7 @@
-2015-11-12 14:34:13,414 Task exception was never retrieved
-future: <Task finished coro=<connect_to_peer() done, defined at .\message_types.py:1338> exception=KeyError('78.177.44.39',) created at c:\Anaconda3\lib\asyncio\tasks.py:330>
+2015-11-13 22:11:37,506 Task exception was never retrieved
+future: <Task finished coro=<connect_to_peer() done, defined at .\message_types.py:1158> exception=KeyError('80.94.76.7',) created at c:\Anaconda3\lib\asyncio\tasks.py:330>
 source_traceback: Object created at (most recent call last):
-  File ".\message_types.py", line 1734, in <module>
+  File ".\message_types.py", line 1558, in <module>
     loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive))
   File "c:\Anaconda3\lib\asyncio\base_events.py", line 304, in run_until_complete
     self.run_forever()
@@ -18,40 +18,26 @@ source_traceback: Object created at (most recent call last):
   File "c:\Anaconda3\lib\asyncio\tasks.py", line 330, in <setcomp>
     fs = {async(f, loop=loop) for f in set(fs)}
 Traceback (most recent call last):
-  File ".\message_types.py", line 1602, in _read_handshake
-    msg_hs = yield from peer.reader.readexactly(68)      # read handshake msg
-  File "c:\Anaconda3\lib\asyncio\streams.py", line 479, in readexactly
-    block = yield from self.read(n)
-  File "c:\Anaconda3\lib\asyncio\streams.py", line 452, in read
-    yield from self._wait_for_data('read')
-  File "c:\Anaconda3\lib\asyncio\streams.py", line 393, in _wait_for_data
-    yield from self._waiter
-  File "c:\Anaconda3\lib\asyncio\futures.py", line 386, in __iter__
-    yield self  # This tells Task to wait for completion.
-  File "c:\Anaconda3\lib\asyncio\tasks.py", line 287, in _wakeup
-    value = future.result()
-  File "c:\Anaconda3\lib\asyncio\futures.py", line 275, in result
-    raise self._exception
-  File "c:\Anaconda3\lib\asyncio\selector_events.py", line 662, in _read_ready
-    data = self._sock.recv(self.max_size)
-ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host
+  File ".\message_types.py", line 1486, in read_peer
+    msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
+  File "c:\Anaconda3\lib\asyncio\streams.py", line 482, in readexactly
+    raise IncompleteReadError(partial, len(partial) + n)
+asyncio.streams.IncompleteReadError: 9 bytes read on a total of 16393 expected bytes
 
 During handling of the above exception, another exception occurred:
 
 Traceback (most recent call last):
-  File ".\message_types.py", line 1381, in connect_to_peer
-    msg_ident = yield from self.read_peer(peer)
-  File ".\message_types.py", line 1631, in read_peer
-    if self.channel_state[ip].open == 1 and self.channel_state[ip].state == 1:
-KeyError: '78.177.44.39'
+  File ".\message_types.py", line 1349, in connect_to_peer
+    msg_ident = yield from self.read_peer(rpeer)
+  File ".\message_types.py", line 1495, in read_peer
+    raise reader.exception()
+TypeError: exceptions must derive from BaseException
 
 During handling of the above exception, another exception occurred:
 
 Traceback (most recent call last):
-  File "c:\Anaconda3\lib\asyncio\tasks.py", line 234, in _step
-    result = coro.throw(exc)
-  File ".\message_types.py", line 1391, in connect_to_peer
-    self._close_peer_connection(peer)
-  File ".\message_types.py", line 552, in _close_peer_connection
-    del self.channel_state[ip]
-KeyError: '78.177.44.39'
+  File "c:\Anaconda3\lib\asyncio\tasks.py", line 238, in _step
+    result = next(coro)
+  File ".\message_types.py", line 1363, in connect_to_peer
+    self.channel_state[rip].state, \
+KeyError: '80.94.76.7'
