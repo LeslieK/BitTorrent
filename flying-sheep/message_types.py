@@ -938,6 +938,54 @@ class Client(object):
                 # peer already has piece
                 pass
 
+    def check_msg_for_handshake(self, peer, buf):
+        """
+        buf: bytearray(msg)
+        """
+        ip, _ = peer.address
+        try:
+            assert buf[1:20].decode() == 'BitTorrent protocol'
+        except UnicodeDecodeError as e:
+           return False
+        except AssertionError as e:
+            return False
+        else:
+            try:
+                assert buf[0] == 19
+            except AssertionError as e:
+                print("check_msg_for_handshake: received handshake\
+                msg with length {}; should be 19".format(buf[0].decode()))
+                raise ConnectionError("check_msg_for_handshake: \
+                received handshake msg with length {}; should be 19"\
+                    .format(buf[0].decode()))
+            #  handshake message
+            msgd = self.rcv_handshake_msg(buf)
+            try:
+                # check info_hash
+                assert msgd['info_hash'] == self.torrent.INFO_HASH
+            except AssertionError as e:
+                print("check_msg_for_handshake: peer is not part of torrent:\
+                expected hash: {}".format(self.torrent.INFO_HASH))
+                raise ConnectionError("check_msg_for_handshake: \
+                peer is not part of torrent: expected hash: {}"\
+                    .format(self.torrent.INFO_HASH))
+            if self.channel_state[ip].state == 1:
+                self.channel_state[ip].state = 2
+
+            # Note: check peer_id
+            # check that peer.peer_id from tracker_response['peers'] (dictionary model)
+            # matches peer.peer_id in handshake (msgd['peer_id'])
+            # tracker response uses compact mode so peer.peer_id is not in tracker_response
+
+            # set peer_id of peer
+            peer.peer_id = msgd['peer_id']
+            # reset peer timer
+            peer.timer = datetime.datetime.utcnow()
+
+            ident = HANDSHAKE_ID  # identifies handshake
+            return ident
+
+
     def process_read_msg(self, peer, msg):
         """process incoming msg from peer - protocol state machine
         
@@ -950,38 +998,13 @@ class Client(object):
         buf = bytearray(msg)
         ip, port = peer.address
         
+        # check for handshake
         try:
-            assert buf[1:20].decode() == 'BitTorrent protocol'
-        except UnicodeDecodeError as e:
-           pass
-        except AssertionError as e:
-            pass
-        else:
-            try:
-                assert buf[0] == 19
-            except AssertionError:
-                raise ConnectionError("received handshake msg with length {}; should be 19".format(buf[0].decode()))
-            
-            #  handshake message
-            msgd = self.rcv_handshake_msg(buf)
-            try:
-                # check info_hash
-                assert msgd['info_hash'] == self.torrent.INFO_HASH
-            except AssertionError:
-                raise ConnectionError("peer is not part of torrent: expected hash: {}"\
-                    .format(self.torrent.INFO_HASH))
-
-            # check protocol
-            if self.channel_state[ip].state == 1:
-                self.channel_state[ip].state = 2
-            else:
-                raise ProtocolError("expected Handshake in state 1; \
-                received in state {}".format(self.channel_state[ip].state))
-            # set peer_id of peer
-            peer.peer_id = msgd['peer_id']
-            # reset peer timer
-            peer.timer = datetime.datetime.utcnow()
-            ident = HANDSHAKE_ID  # identifies handshake
+            ident = self.check_msg_for_handshake(peer, buf)
+        except (ConnectionError, ProtocolError) as e:
+            print('received Handshake msg with errors')
+            raise e
+        if ident==HANDSHAKE_ID:
             return ident
 
         ident = buf[4]
@@ -995,7 +1018,7 @@ class Client(object):
                 raise ConnectionError("Choke: bad length  received: {} expected: 1"\
                                         .format(length))
             peer.timer = datetime.datetime.utcnow()
-            self.bt_state[ip].choked = 1  # peer choked client
+            self.bt_state[ip].choked = 1  # peer chokes client
             if self.channel_state[ip].state == 30:
                 self.channel_state[ip].state = 3
             elif self.channel_state[ip].state == 6:
@@ -1006,6 +1029,7 @@ class Client(object):
                 self.channel_state[ip].state = 10
             elif self.channel_state[ip].state == 50:
                 self.channel_state[ip].state = 4
+            pass # peer chokes client
 
         elif ident == 1:
             #  unchoke message
@@ -1025,6 +1049,7 @@ class Client(object):
                 self.channel_state[ip] = 9
             elif self.channel_state[ip] == 4:
                 self.channel_state[ip] = 50
+            pass # peer unchokes client
         elif ident == 2:
             #  interested message
             length = self._4bytes_to_int(buf[0:4])
@@ -1054,7 +1079,7 @@ class Client(object):
             peer.timer = datetime.datetime.utcnow()
             msgd = self.rcv_have_msg(ip, buf)
             if self.channel_state[ip].state == 4:
-                self.channel_state[ip].state = 3   
+                self.channel_state[ip].state = 3  # peer sends have message 
         elif ident == 5:
             #  bitfield message
             try:
@@ -1073,11 +1098,11 @@ class Client(object):
                 raise ProtocolError(
                     'Bitfield has at least one 1 in rightmost {} (padding) bits'\
                         .format(number_padding_bits))
-            self.channel_state[ip].state = 4
+            self.channel_state[ip].state = 4  # peer sends bitfield message
         elif ident == 6:
             #  request message
-            peer.timer = datetime.datetime.utcnow()
-            pass
+            peer.timer = datetime.datetime.utcnow() 
+            pass # peer requests block from client
         elif ident == 7:
             #  piece message
             peer.timer = datetime.datetime.utcnow()
@@ -1090,15 +1115,21 @@ class Client(object):
             except Exception as e:
                 print(e.args)
                 raise e
-            pass
+            if self.channel_state[ip].state == 7:
+                if result == 'done':
+                    self.channel_state[ip].state = 8
+                else:
+                    # result is 'not done' or 'bad hash'
+                    self.channel_state[ip].state = 6
+            pass # client reads block from peer
         elif ident == 8:
             #  cancel message
             peer.timer = datetime.datetime.utcnow()
-            pass
+            pass # peer cancels block from piece
         elif ident == 9:
             #  port message
             peer.timer = datetime.datetime.utcnow()
-            pass
+            pass # peer sends port message
         elif ident == 20:
             # extension
             peer.timer = datetime.datetime.utcnow()
@@ -1115,14 +1146,16 @@ class Client(object):
         peer: peer object
         ident: integer identifying msg
 
-        generate msgs to send
         downloader:
-        handshake
+        client writes:
+        handshake (initiates this)
         interested
         not interested
         request      
 
         uploader:
+        client writes:
+        handshake (in response to peer's handshake)
         choke
         unchoke
         bitfield
@@ -1145,6 +1178,9 @@ class Client(object):
             self.bt_state[ip].interested = 0  # client not interested in peer
             if self.channel_state[ip].state == 8:
                 self.channel_state[ip].state = 9
+        elif ident == 4:
+            # client writes Have to peer
+            pass
         elif ident == 6:
             # client writes Request to peer
             if self.channel_state[ip].state == 6:
@@ -1498,6 +1534,8 @@ class Client(object):
     def read_peer(self, peer):
         """
         reads msg from peer and processes it
+
+        exceptions are re-raised to the calling function (connect_to_peer)
         """
         ip, _ = peer.address
         reader = peer.reader
