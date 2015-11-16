@@ -100,7 +100,10 @@ class PieceBuffer(object):
         self.piece_info = {}
         
     def is_full(self):
-        return not self.free_rows  
+        return not self.free_rows
+    
+    def is_registered(self, piece_index):
+        return piece_index in self.piece_info  
 
     def insert_bytes(self, piece_index, begin, block):
         """
@@ -110,10 +113,10 @@ class PieceBuffer(object):
         begin: int
         block: sequence of bytes (bytearray)
         """
-        if not self.piece_info or piece_index not in self.piece_info:
-            logging.debug("{} not in buffer. Registering piece...".format(piece_index))
-            print("{} not in buffer. Registering piece...".format(piece_index))
-            self._register_piece(piece_index)
+        #if not self.piece_info or piece_index not in self.piece_info:
+        #    logging.debug("{} not in buffer. Registering piece...".format(piece_index))
+        #    print("{} not in buffer. Registering piece...".format(piece_index))
+        #    self._register_piece(piece_index)
 
         row = self.piece_info[piece_index]['row']
         
@@ -136,7 +139,8 @@ class PieceBuffer(object):
         assert self.buffer[row][begin:begin+len(ablock)] == ablock
 
         # update bitfield (each bit represents a block in the piece)
-        self._update_bitfield(piece_index)
+        #self._update_bitfield(piece_index)
+        self._update_bitfield(piece_index, begin)
 
         # check if all blocks received
         if self._is_all_blocks_received(piece_index):
@@ -261,13 +265,14 @@ class PieceBuffer(object):
         field = 1 << number_of_blocks
         return field
     
-    def _update_bitfield(self, piece_index):
+    def _update_bitfield(self, piece_index, offset):
         """
         update bitfield for buffer row
         each bit represents a block
         rightmost bit (LSB): block 0
         """
-        block_number = self.piece_info[piece_index]['offset'] // BLOCK_SIZE
+        #block_number = self.piece_info[piece_index]['offset'] // BLOCK_SIZE
+        block_number = offset // BLOCK_SIZE
 
         bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
         length = len(bfs)
@@ -916,9 +921,31 @@ class Client(object):
             
         elif result == 'not done':
             # not all blocks received
-            # increment offset
-            self.pbuffer.piece_info[index]['offset'] = begin + length - 9 # lenth of block = length - 9
+            # increment offset after block bytes are received and inserted into buffer
+            # self.pbuffer.piece_info[index]['offset'] = begin + length - 9 # lenth of block = length - 9
+            # -- modified logic -- offset is updated in connect_to_peer/write Request
+            pass
         return result
+
+    def _new_offset(self, piece_index, begin):
+        """
+        begin: begin value from piece msg
+        length: length value from piece msg
+        returns next offset value for this piece_index
+        """
+        if piece_index == self.torrent.LAST_PIECE_INDEX:
+            block_num = begin // BLOCK_SIZE
+            if block_num  == self.last_piece_number_blocks - 1:
+                # begin is offset of last block of last piece
+                next_offset = 0
+            else:
+                # begin is offset of non-last-block of last piece
+                next_offset = begin + BLOCK_SIZE 
+        else:
+            # piece is not last piece
+            next_offset = (begin + BLOCK_SIZE) % self.piece_length
+        return next_offset
+
 
     def send_have_msg(self, piece_index):
         msg = self.make_have_msg(piece_index)
@@ -1405,10 +1432,25 @@ class Client(object):
             if rip and self.channel_state[rip].open and \
                 not self.bt_state[rip].choked and \
                 rindex not in self.pbuffer.completed_pieces:
+                    if not self.pbuffer.is_registered(rindex):
+                        try:
+                            self.pbuffer._register_piece(rindex)
+                        except Exception as e:
+                            print(e.args)
+                        logging.debug("{} not in buffer. Registering piece...".format(rindex))
+                        print("{} not in buffer. Registering piece...".format(rindex))
                     # write Request
-                    offset = 0 if rindex not in self.pbuffer.piece_info else self.pbuffer.piece_info[rindex]['offset']
+                    #offset = 0 if rindex not in self.pbuffer.piece_info \
+                    #    else self.pbuffer.piece_info[rindex]['offset']
+                    offset = self.pbuffer.piece_info[rindex]['offset']
+                    # update offset; invariant: offset stores value for next request
+                    # rindex must be registered in piece_info first
+                    self.pbuffer.piece_info[rindex]['offset'] = self._new_offset(rindex, offset)
+
                     print('connect_to_ip: ready to write Request to {} offset: {}'.format(rip, offset))
                     logging.debug('connect_to_peer: ready to write Request to {} offset: {}'.format(rip, offset))
+                    
+                    # construct request msg
                     msg = self.make_request_msg(rindex, offset)
                     
                     try:
