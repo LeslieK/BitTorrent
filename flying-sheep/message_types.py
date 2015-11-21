@@ -270,7 +270,7 @@ class PieceBuffer(object):
         each bit represents a block
         rightmost bit (LSB): block 0
         """
-        #block_number = self.piece_info[piece_index]['offset'] // BLOCK_SIZE
+       
         block_number = offset // BLOCK_SIZE
 
         bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
@@ -921,6 +921,9 @@ class Client(object):
         index = self._4bytes_to_int(buf[5:9])
         begin = self._4bytes_to_int(buf[9:13])
         block = buf[13:]
+
+        if self.is_block_received(index, begin):
+            return 'already have block'
         try:
             result = self.pbuffer.insert_bytes(index, begin, block)
         except Exception as e:
@@ -960,7 +963,27 @@ class Client(object):
             # old: self.pbuffer.piece_info[index]['offset'] = begin + length - 9 # lenth of block = length - 9
             # -- modified logic -- offset is updated in connect_to_peer/write Request
             pass
+
+        elif result == 'already have block':
+            pass
         return result
+
+    def is_block_received(self, index, begin):
+        """
+        True if block from piece index has already been received
+        test if bit associated with block in block_bitfield is a 1
+        """
+        if index in self.pbuffer.completed_pieces:
+            return True
+        if index in self.pbuffer.piece_info:
+            block_bitfield = self.pbuffer.piece_info[index]['bitfield'] # an integer
+            block_num = self.get_block_num(begin)
+            return (block_bitfield >> block_num) % 2 == 1 # block bit is a 1
+        else:
+            return False
+
+    def get_block_num(self, begin):
+        return begin // BLOCK_SIZE
 
     def _new_offset(self, piece_index, begin):
         """
@@ -1184,9 +1207,11 @@ class Client(object):
             if self.channel_state[ip].state == 7:
                 if result == 'done':
                     self.channel_state[ip].state = 8
-                else:
-                    # result is 'not done' or 'bad hash'
+                elif result == 'not done' or result == 'bad hash':
                     self.channel_state[ip].state = 6
+                elif result == 'already have block':
+                    # piece msg is a duplicate
+                    pass
             pass # client reads block from peer
         elif ident == 8:
             #  cancel message
@@ -1397,23 +1422,23 @@ class Client(object):
         try:
             result = self._get_next_piece()
         except ConnectionError as e:
-            logging.debug('connect_to_peer: error in get_next_piece {}'.format(e.args))
-            print('connect_to_peer: error in get_next_piece {}'.format(e.args))
+            logging.debug('select_piece: error in get_next_piece {}'.format(e.args))
+            print('select_piece: error in get_next_piece {}'.format(e.args))
             raise e
         except Exception as e:
-            logging.debug('connect_to_peer: error in get_next_piece {}'.format(e.args))
-            print('connect_to_peer: error in get_next_piece {}'.format(e.args))
+            logging.debug('select_piece: error in get_next_piece {}'.format(e.args))
+            print('select_piece: error in get_next_piece {}'.format(e.args))
             raise e
         if result == 'success':
             # [rindex, {set of rpeers}] assigned to self.selected_index_peers
             return result
         elif result == 'no open connections':
             # this should not happen
-            print('connect_to_peer::_get_next_piece: no open connections')
+            print('select_piece: no open connections')
             return result # connect to tracker
         elif result == 'need more pieces': # self.piece_cnts has been consumed
             # this should not happen
-            print('connect_to_peer::_get_next_piece: self.piece_cnts have been consumed')
+            print('select_piece: self.piece_cnts have been consumed')
             return result # connect to tracker
 
     @asyncio.coroutine 
@@ -1432,14 +1457,14 @@ class Client(object):
                     rpeer.writer.write(INTERESTED)
                     yield from rpeer.writer.drain()
                 except Exception as e:
-                    logging.debug('connect_to_peer: {}: error in writing Interested'.format(rip, e.args))
-                    print('connect_to_peer: {}: error in writing Interested'.format(rip, e.args))
+                    logging.debug('get_piece: {}: error in writing Interested'.format(rip, e.args))
+                    print('get_piece: {}: error in writing Interested'.format(rip, e.args))
                     self._close_peer_connection(rpeer)
 
                 self.process_write_msg(rpeer, bt_messages_by_name['Interested'])
                 
-                logging.debug("connect_to_peer: {}: wrote INTERESTED".format(rip))
-                print("connect_to_peer: {}: wrote INTERESTED".format(rip))
+                logging.debug("get_piece: {}: wrote INTERESTED".format(rip))
+                print("get_piece: {}: wrote INTERESTED".format(rip))
             else:
                 # channel is closed or client is already interested
                 pass
@@ -1452,19 +1477,19 @@ class Client(object):
                 try:
                     msg_ident = yield from self.read_peer(rpeer)  
                 except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
-                    logging.debug('connect_to_peer: {} expected Unchoke {}'.format(rip, e.args))
-                    print('connect_to_peer: {} expected Unchoke {}'.format(rip, e.args))
+                    logging.debug('get_piece: {} expected Unchoke {}'.format(rip, e.args))
+                    print('get_piece: {} expected Unchoke {}'.format(rip, e.args))
                     self._close_peer_connection(rpeer)
                 except Exception as e:
-                    logging.debug('connect_to_peer: {} expected Unchoke Other Exception 2 {}'.format(rip, e.args))
-                    print('connect_to_peer: {} expected Unchoke {}'.format(rip, e.args))
+                    logging.debug('get_piece: {} expected Unchoke Other Exception 2 {}'.format(rip, e.args))
+                    print('get_piece: {} expected Unchoke {}'.format(rip, e.args))
                     self._close_peer_connection(rpeer)
                 #finally:
                 #    if not self.active_peers:
                 #        # close Task so loop stops and program can reconnect to Tracker 
                 #        return
-                logging.debug("connect_to_peer: {}: received {}".format(rip, bt_messages[msg_ident]))
-                print("connect_to_peer: {}: received {}".format(rip, bt_messages[msg_ident]))
+                logging.debug("get_piece: {}: received {}".format(rip, bt_messages[msg_ident]))
+                print("get_piece: {}: received {}".format(rip, bt_messages[msg_ident]))
                 if bt_messages[msg_ident] == 'Unchoke':
                     break
 
@@ -1480,8 +1505,8 @@ class Client(object):
                         except Exception as e:
                             print(e.args)
                             logging.debug(e.args)
-                        logging.debug("{} not in buffer. Registering piece {}...".format(rindex, rindex))
-                        print("{} not in buffer. Registering piece {}...".format(rindex, rindex))
+                        logging.debug("get_piece: {} not in buffer. Registering piece {}...".format(rindex, rindex))
+                        print("get_piece: {} not in buffer. Registering piece {}...".format(rindex, rindex))
 
                     # write Request
                     offset = self.pbuffer.piece_info[rindex]['offset']
@@ -1489,9 +1514,9 @@ class Client(object):
                     # rindex must be registered in piece_info first
                     self.pbuffer.piece_info[rindex]['offset'] = self._new_offset(rindex, offset)
 
-                    print('connect_to_peer: index: {} ready to write Request to {} offset: {}'\
+                    print('get_piece: index: {} ready to write Request to {} offset: {}'\
                         .format(rindex, rip, offset))
-                    logging.debug('connect_to_peer: index {} ready to write Request to {} offset: {}'\
+                    logging.debug('get_piece: index {} ready to write Request to {} offset: {}'\
                         .format(rindex, rip, offset))
                     
                     # construct request msg
@@ -1501,27 +1526,27 @@ class Client(object):
                         rpeer.writer.write(msg)
                         yield from rpeer.writer.drain()
                     except Exception as e:
-                        print('connect_to_peer: {} write Request error'.format(rip, e.args))
-                        print('connect_to_peer: {} write Request error'.format(rip, e.args))
+                        print('get_piece: {} write Request error'.format(rip, e.args))
+                        print('get_piece: {} write Request error'.format(rip, e.args))
                         self._close_peer_connection(rpeer)
                     
                     self.process_write_msg(rpeer, bt_messages_by_name['Request'])
-                    logging.debug("connect_to_peer: {}: wrote Request for index {} ".format(rip, rindex))
-                    print("connect_to_peer: {}: wrote Request for index {} ".format(rip, rindex))
-                    logging.debug('connect_to_peer: {} expect to receive Piece {}'.format(rip, rindex))
-                    print('connect_to_peer: {} expect to receive Piece {}'.format(rip, rindex))
+                    logging.debug("get_piece: {}: wrote Request for index {} ".format(rip, rindex))
+                    print("get_piece: {}: wrote Request for index {} ".format(rip, rindex))
+                    logging.debug('get_piece: {} expect to receive Piece {}'.format(rip, rindex))
+                    print('get_piece: {} expect to receive Piece {}'.format(rip, rindex))
                 
                     # read until Piece
                     try:
                         msg_ident = yield from self.read_peer(rpeer)
 
                     except (ProtocolError, TimeoutError, OSError) as e:
-                        logging.debug('connect_to_peer: {} expected Piece {}'.format(rip, e.args))
-                        print('connect_to_peer: {} expected Piece {}'.format(rip, e.args))
+                        logging.debug('get_piece: {} expected Piece {}'.format(rip, e.args))
+                        print('get_piece: {} expected Piece {}'.format(rip, e.args))
                         self._close_peer_connection(rpeer)
                     except Exception as e:
                         print(e)
-                        logging.debug("connect_to_peer: expect to read Piece from ip: {} {} \
+                        logging.debug("get_piece: expect to read Piece from ip: {} {} \
                         channel_state: {} \
                         open: {} \
                         choked: {} \
@@ -1533,8 +1558,8 @@ class Client(object):
                             self.bt_state[rip].interested))
                         self._close_peer_connection(rpeer)
 
-                    logging.debug("connect_to_peer: {}: successfully read {} index: {}".format(rip, bt_messages[msg_ident], rindex))
-                    print("connect_to_peer: {}: successfully read {} index: {}".format(rip, bt_messages[msg_ident], rindex))
+                    logging.debug("get_piece: {}: successfully read {} index: {}".format(rip, bt_messages[msg_ident], rindex))
+                    print("get_piece: {}: successfully read {} index: {}".format(rip, bt_messages[msg_ident], rindex))
 
                     while bt_messages[msg_ident] != 'Piece' and \
                         self.channel_state[rip].open and \
@@ -1563,8 +1588,8 @@ class Client(object):
                         #    if not self.active_peers:
                         #        # no open connections
                         #        return
-                        logging.debug("connect_to_peer: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
-                        print("connect_to_peer: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
+                        logging.debug("get_piece: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
+                        print("get_piece: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
                     # received Piece msg or Choke msg or Exception (if exception: client closes connection to rip)
                     # top of while loop: if not all_pieces(), get a piece index 
                     # (could be the same piece index but with a new offset)
@@ -1573,17 +1598,17 @@ class Client(object):
                 pass
             
         # channel is closed or piece is completely downloaded
-        ## for each open peer (if any): reset Interested to Not Interested
-        #try:
-        #    rpeer.writer.write(NOT_INTERESTED)
-        #    yield from rpeer.writer.drain()
-        #except Exception as e:
-        #    logging.debug('connect_to_peer: {} error in writing Not Interested'.format(rip))
-        #    print('connect_to_peer: {} error in writing Not Interested'.format(rip))
-        #    self._close_peer_connection(rpeer)
-        #self.bt_state[rip].interested=0
-        #print('connect_to_peer: successfully wrote Not Interested to {}'.format(rip))
-        #logging.debug('connect_to_peer: successfully wrote Not Interested to {}'.format(rip))
+        # for each open peer (if any): reset Interested to Not Interested
+        try:
+            rpeer.writer.write(NOT_INTERESTED)
+            yield from rpeer.writer.drain()
+        except Exception as e:
+            logging.debug('get_piece: {} error in writing Not Interested'.format(rip))
+            print('get_piece: {} error in writing Not Interested'.format(rip))
+            self._close_peer_connection(rpeer)
+        self.bt_state[rip].interested=0
+        print('get_piece: successfully wrote Not Interested to {}'.format(rip))
+        logging.debug('get_piece: successfully wrote Not Interested to {}'.format(rip))
         return
                             
                 
@@ -1646,12 +1671,12 @@ class Client(object):
                 msg_length = yield from reader.readexactly(4)
 
             except (ProtocolError, TimeoutError, OSError) as e:
-                logging.debug("read_peer {}: caught error from length: {}".format(ip, e.args))
+                logging.debug("read_peer {}: caught error from reading msg_length: {}".format(ip, e.args))
+                print("read_peer {}: caught error from reading msg_length: {}".format(ip, e.args))
                 raise e
             except Exception as e:
                 logging.debug("read_peer {}: caught Other Exception 2:  {}".format(ip, e.args))
-                #if reader._transport_.conn_lost:
-                #raise reader.exception()
+                print("read_peer {}: caught Other Exception 2:  {}".format(ip, e.args))
                 raise e
             if msg_length == KEEPALIVE:
                 peer.timer = datetime.datetime.utcnow()
@@ -1672,6 +1697,7 @@ class Client(object):
                     raise e
                 msg_ident = msg_body[0]
                 if msg_ident in list(range(10)) or msg_ident == KEEPALIVE_ID:
+
                     # processing the read msg happens here
                     self.process_read_msg(peer, msg_length + msg_body)
 
