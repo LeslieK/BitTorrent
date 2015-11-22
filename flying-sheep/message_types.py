@@ -965,7 +965,8 @@ class Client(object):
             pass
 
         elif result == 'already have block':
-            pass
+            print('rcv_piece_msg: received duplicate block begin: {}'.format(begin))
+            logging.debug('rcv_piece_msg: received duplicate block begin: {}'.format(begin))
         return result
 
     def is_block_received(self, index, begin):
@@ -985,23 +986,74 @@ class Client(object):
     def get_block_num(self, begin):
         return begin // BLOCK_SIZE
 
+    #def _new_offset(self, piece_index, begin):
+    #    """
+    #    begin: begin value from piece msg
+    #    length: length value from piece msg
+    #    returns next offset value for this piece_index
+    #    """
+    #    if piece_index == self.torrent.LAST_PIECE_INDEX:
+    #        block_num = begin // BLOCK_SIZE
+    #        if block_num  == self.last_piece_number_blocks - 1:
+    #            # begin is offset of last block of last piece
+    #            next_offset = 0
+    #        else:
+    #            # begin is offset of non-last-block of last piece
+    #            next_offset = begin + BLOCK_SIZE 
+    #    else:
+    #        # piece is not last piece
+    #        next_offset = (begin + BLOCK_SIZE) % self.piece_length
+    #    return next_offset
+
+    def _get_next_offset(self, piece_index, offset):
+        """
+        helper method for _new_offset
+        """
+        block_num = self.get_block_num(offset)
+        if piece_index == self.torrent.LAST_PIECE_INDEX:
+            if block_num  == self.last_piece_number_blocks - 1:
+                # current offset is last block of last piece
+                next_offset = 0
+            else:
+                # offset is non-last-block of last piece
+                next_offset = offset + BLOCK_SIZE
+        else:
+            # piece is not last piece
+            next_offset = (offset + BLOCK_SIZE) % self.piece_length
+        return next_offset
+
     def _new_offset(self, piece_index, begin):
         """
         begin: begin value from piece msg
         length: length value from piece msg
-        returns next offset value for this piece_index
+        returns next offset value for this piece_index 
+        (for block not yet received) 
         """
-        if piece_index == self.torrent.LAST_PIECE_INDEX:
-            block_num = begin // BLOCK_SIZE
-            if block_num  == self.last_piece_number_blocks - 1:
-                # begin is offset of last block of last piece
-                next_offset = 0
-            else:
-                # begin is offset of non-last-block of last piece
-                next_offset = begin + BLOCK_SIZE 
-        else:
-            # piece is not last piece
-            next_offset = (begin + BLOCK_SIZE) % self.piece_length
+        def is_power_of_2(n):
+            return n & (n - 1) == 0
+
+        bitfield = self.pbuffer.piece_info[piece_index]['bitfield'] # an int
+
+        curr_offset = begin
+        next_offset = self._get_next_offset(piece_index, curr_offset)
+        curr_block_num = self.get_block_num(curr_offset)
+        next_block_num = self.get_block_num(next_offset)
+
+        x = bitfield | (1 << curr_block_num)
+        if is_power_of_2(x+1):
+           # bitfield has one 0 (at curr_offset)
+           # about to be all 1s if block at curr_offset is received
+           return curr_offset
+        
+        if bitfield:
+            # bitfield needs more than 1 block to be all 1s
+            while bitfield & (1 << next_block_num):
+                # next offset is for block that client already has
+                # continue to find next_offset     
+                next_offset = self._get_next_offset(piece_index, next_offset)
+                next_block_num = self.get_block_num(next_offset)
+            return next_offset
+        # bitfield is all 0s
         return next_offset
 
 
@@ -1116,6 +1168,8 @@ class Client(object):
                 self.channel_state[ip].state = 10
             elif self.channel_state[ip].state == 50:
                 self.channel_state[ip].state = 4
+            elif self.channel_state[ip].state == 8:
+                self.channel_state[ip].state = 81
             pass # peer chokes client
 
         elif ident == 1:
@@ -1137,7 +1191,10 @@ class Client(object):
             elif self.channel_state[ip].state == 4:
                 self.channel_state[ip].state = 50
             elif self.channel_state[ip].state == 71:
-                self.channel_state[ip].state = 7
+                # when waiting to recv Piece but get Unchoke, go back to Req
+                self.channel_state[ip].state = 6  
+            elif self.channel_state[ip].state == 81:
+                self.channel_state[ip].state = 8
             pass # peer unchokes client
         elif ident == 2:
             #  interested message
@@ -1210,8 +1267,10 @@ class Client(object):
                 elif result == 'not done' or result == 'bad hash':
                     self.channel_state[ip].state = 6
                 elif result == 'already have block':
-                    # piece msg is a duplicate
-                    pass
+                    # piece msg is a duplicate: go to state 6 or stay in state 7?
+                    self.channel_state[ip].state = 6
+                    print('process_read_msg: duplicate block')
+                    logging.debug('process_read_msg: duplicate block')
             pass # client reads block from peer
         elif ident == 8:
             #  cancel message
@@ -1265,7 +1324,9 @@ class Client(object):
             elif self.channel_state[ip].state == 50:
                 self.channel_state[ip].state = 6
             elif self.channel_state[ip].state == 9:
-                self.channel_state[ip].state = 8
+                self.channel_state[ip].state = 6 # 8
+            elif self.channel_state[ip].state == 10: # added
+                self.channel_state[ip].state = 5
         elif ident == 3:
             # client writes Not Interested to peer
             self.bt_state[ip].interested = 0  # client not interested in peer
@@ -1463,8 +1524,8 @@ class Client(object):
 
                 self.process_write_msg(rpeer, bt_messages_by_name['Interested'])
                 
-                logging.debug("get_piece: {}: wrote INTERESTED".format(rip))
-                print("get_piece: {}: wrote INTERESTED".format(rip))
+                logging.debug("get_piece: {}: wrote INTERESTED state {}".format(rip, self.channel_state[rip].state))
+                print("get_piece: {}: wrote INTERESTED state {}".format(rip, self.channel_state[rip].state))
             else:
                 # channel is closed or client is already interested
                 pass
@@ -1472,8 +1533,10 @@ class Client(object):
             # if Choked, Read until Unchoked
             while self.channel_state[rip].open and self.bt_state[rip].choked:
 
-                logging.info("{}: client ready to receive Unchoke".format(rip))
-                print("{}: client ready to receive Unchoke".format(rip))
+                logging.debug("get_piece: {}: client ready to receive Unchoke state {}"\
+                    .format(rip, self.channel_state[rip].state))
+                print("get_piece: {}: client ready to receive Unchoke state {}"\
+                    .format(rip, self.channel_state[rip].state))
                 try:
                     msg_ident = yield from self.read_peer(rpeer)  
                 except (ProtocolError, TimeoutError, OSError, ConnectionResetError) as e:
@@ -1488,8 +1551,10 @@ class Client(object):
                 #    if not self.active_peers:
                 #        # close Task so loop stops and program can reconnect to Tracker 
                 #        return
-                logging.debug("get_piece: {}: received {}".format(rip, bt_messages[msg_ident]))
-                print("get_piece: {}: received {}".format(rip, bt_messages[msg_ident]))
+                logging.debug("get_piece: {}: received {} state {}"\
+                    .format(rip, bt_messages[msg_ident], self.channel_state[rip].state))
+                print("get_piece: {}: received {} state {}"\
+                    .format(rip, bt_messages[msg_ident], self.channel_state[rip].state))
                 if bt_messages[msg_ident] == 'Unchoke':
                     break
 
@@ -1505,8 +1570,10 @@ class Client(object):
                         except Exception as e:
                             print(e.args)
                             logging.debug(e.args)
-                        logging.debug("get_piece: {} not in buffer. Registering piece {}...".format(rindex, rindex))
-                        print("get_piece: {} not in buffer. Registering piece {}...".format(rindex, rindex))
+                        logging.debug("get_piece: {} not in buffer. Registering piece {}... state {}"\
+                            .format(rindex, rindex, self.channel_state[rip].state))
+                        print("get_piece: {} not in buffer. Registering piece {}...state {}"\
+                            .format(rindex, rindex, self.channel_state[rip].state))
 
                     # write Request
                     offset = self.pbuffer.piece_info[rindex]['offset']
@@ -1514,10 +1581,10 @@ class Client(object):
                     # rindex must be registered in piece_info first
                     self.pbuffer.piece_info[rindex]['offset'] = self._new_offset(rindex, offset)
 
-                    print('get_piece: index: {} ready to write Request to {} offset: {}'\
-                        .format(rindex, rip, offset))
-                    logging.debug('get_piece: index {} ready to write Request to {} offset: {}'\
-                        .format(rindex, rip, offset))
+                    print('get_piece: index: {} ready to write Request to {} begin: {} state {}'\
+                        .format(rindex, rip, offset, self.channel_state[rip].state))
+                    logging.debug('get_piece: index {} ready to write Request to {} begin: {} state {}'\
+                        .format(rindex, rip, offset, self.channel_state[rip].state))
                     
                     # construct request msg
                     msg = self.make_request_msg(rindex, offset)
@@ -1527,14 +1594,18 @@ class Client(object):
                         yield from rpeer.writer.drain()
                     except Exception as e:
                         print('get_piece: {} write Request error'.format(rip, e.args))
-                        print('get_piece: {} write Request error'.format(rip, e.args))
+                        logging.debug('get_piece: {} write Request'.format(rip, e.args))
                         self._close_peer_connection(rpeer)
                     
                     self.process_write_msg(rpeer, bt_messages_by_name['Request'])
-                    logging.debug("get_piece: {}: wrote Request for index {} ".format(rip, rindex))
-                    print("get_piece: {}: wrote Request for index {} ".format(rip, rindex))
-                    logging.debug('get_piece: {} expect to receive Piece {}'.format(rip, rindex))
-                    print('get_piece: {} expect to receive Piece {}'.format(rip, rindex))
+                    logging.debug("get_piece: {}: wrote Request for index {} begin {} state {}"\
+                        .format(rip, rindex, offset, self.channel_state[rip].state))
+                    print("get_piece: {}: wrote Request for index {} begin {} state {}"\
+                        .format(rip, rindex, offset, self.channel_state[rip].state))
+                    logging.debug('get_piece: {} expect to receive Piece {} state {}'\
+                        .format(rip, rindex, self.channel_state[rip].state))
+                    print('get_piece: {} expect to receive Piece {} state {}'\
+                        .format(rip, rindex, self.channel_state[rip].state))
                 
                     # read until Piece
                     try:
@@ -1558,8 +1629,10 @@ class Client(object):
                             self.bt_state[rip].interested))
                         self._close_peer_connection(rpeer)
 
-                    logging.debug("get_piece: {}: successfully read {} index: {}".format(rip, bt_messages[msg_ident], rindex))
-                    print("get_piece: {}: successfully read {} index: {}".format(rip, bt_messages[msg_ident], rindex))
+                    logging.debug("get_piece: {}: successfully read {} index: {} state {}"\
+                        .format(rip, bt_messages[msg_ident], rindex, self.channel_state[rip].state))
+                    print("get_piece: {}: successfully read {} index: {} state {}"\
+                        .format(rip, bt_messages[msg_ident], rindex, self.channel_state[rip].state))
 
                     while bt_messages[msg_ident] != 'Piece' and \
                         self.channel_state[rip].open and \
@@ -1588,8 +1661,10 @@ class Client(object):
                         #    if not self.active_peers:
                         #        # no open connections
                         #        return
-                        logging.debug("get_piece: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
-                        print("get_piece: {}: successfully read {}".format(rip, bt_messages[msg_ident]))
+                        logging.debug("get_piece: {}: successfully read {} state {}"\
+                            .format(rip, bt_messages[msg_ident], self.channel_state[rip].state))
+                        print("get_piece: {}: successfully read {} state {}"\
+                            .format(rip, bt_messages[msg_ident], self.channel_state[rip].state))
                     # received Piece msg or Choke msg or Exception (if exception: client closes connection to rip)
                     # top of while loop: if not all_pieces(), get a piece index 
                     # (could be the same piece index but with a new offset)
@@ -1606,9 +1681,12 @@ class Client(object):
             logging.debug('get_piece: {} error in writing Not Interested'.format(rip))
             print('get_piece: {} error in writing Not Interested'.format(rip))
             self._close_peer_connection(rpeer)
-        self.bt_state[rip].interested=0
-        print('get_piece: successfully wrote Not Interested to {}'.format(rip))
-        logging.debug('get_piece: successfully wrote Not Interested to {}'.format(rip))
+
+        self.process_write_msg(rpeer, bt_messages_by_name['Not Interested'])
+        print('get_piece: successfully wrote Not Interested to {} state {}'\
+            .format(rip, self.channel_state[rip].state))
+        logging.debug('get_piece: successfully wrote Not Interested to {} state {}'\
+            .format(rip, self.channel_state[rip].state))
         return
                             
                 
@@ -1693,7 +1771,6 @@ class Client(object):
                 except Exception as e:
                     logging.debug("read_peer {}: caught Other Exception {}".format(ip, e.args))
                     print("read_peer {}: caught error from body {}".format(ip, e.args))
-                    #raise reader.exception()
                     raise e
                 msg_ident = msg_body[0]
                 if msg_ident in list(range(10)) or msg_ident == KEEPALIVE_ID:
