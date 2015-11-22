@@ -29,6 +29,7 @@ MAX_PEERS = 50
 BLOCK_SIZE = DEFAULT_BLOCK_LENGTH
 MAX_BLOCK_SIZE = bytes([4, 0, 0, 0]) # 2**14 == 16384
 MAX_PEERS_TO_REQUEST_FROM = 1  # used in client._get_next_piece()
+MAX_UNCHOKED_PEERS = 5
 
 NUMWANT = 5  # GET parameter to tracker
 BUFFER_SIZE = 12
@@ -115,10 +116,6 @@ class PieceBuffer(object):
         begin: int
         block: sequence of bytes (bytearray)
         """
-        #if not self.piece_info or piece_index not in self.piece_info:
-        #    logging.debug("{} not in buffer. Registering piece...".format(piece_index))
-        #    print("{} not in buffer. Registering piece...".format(piece_index))
-        #    self._register_piece(piece_index)
 
         row = self.piece_info[piece_index]['row']
         
@@ -156,7 +153,7 @@ class PieceBuffer(object):
                 # piece hash does not match torrent match
                 return 'bad hash'
         else:
-            # not all pieces received
+            # not all blocks received
             return 'not done'
 
     def reset(self, piece_index, free_row=False):
@@ -421,10 +418,11 @@ class Client(object):
         self.TRACKER_EVENT = 'started'
 
         # used by _get_next_piece
-        self.selected_piece_peer = [] # [piece_index, peer]
+        self.selected_piece_peer = [] # [piece_index, peer] NOT USED since refactoring
         self.selected_piece_peers = [] # [piece_index, <set of peers>]
 
         # used by uploader
+        self.number_unchoked_peers = 0
         self.channel_state_upload = {} # {ip: state} state=0
 
     def shutdown(self):
@@ -900,6 +898,7 @@ class Client(object):
         msgd['index'] = self._4bytes_to_int(buf[5:9])
         msgd['begin'] = self._4bytes_to_int(buf[9:13])
         msgd['block_length'] = self._4bytes_to_int(buf[13:17])
+        return msgd
 
     def rcv_piece_msg(self, buf):
         """
@@ -923,6 +922,10 @@ class Client(object):
         block = buf[13:]
 
         if self.is_block_received(index, begin):
+            print('rcv_piece_msg: received duplicate block index {} begin: {}'\
+                .format(index, begin))
+            logging.debug('rcv_piece_msg: received duplicate block index {} begin: {}'\
+                .format(index, begin))
             return 'already have block'
         try:
             result = self.pbuffer.insert_bytes(index, begin, block)
@@ -949,7 +952,6 @@ class Client(object):
                 self.send_have_msg(index)
             except Exception as e:
                 raise e
-            
 
         elif result == 'bad hash':
             # all blocks received and hash doesn't verify
@@ -963,11 +965,40 @@ class Client(object):
             # old: self.pbuffer.piece_info[index]['offset'] = begin + length - 9 # lenth of block = length - 9
             # -- modified logic -- offset is updated in connect_to_peer/write Request
             pass
-
-        elif result == 'already have block':
-            print('rcv_piece_msg: received duplicate block begin: {}'.format(begin))
-            logging.debug('rcv_piece_msg: received duplicate block begin: {}'.format(begin))
         return result
+
+    def make_piece_msg(index, begin, length_of_block):
+        length = self._int_to_4bytes(9 + length_of_block)
+        ident = bytes([7])
+        piece_index = self._int_to_4bytes(index)
+        offset = self._int_to_4bytes(begin)
+        block = self._get_block_from_buffer(index, begin, length_of_block)
+        return length + ident + piece_index + offset + block
+
+    def _get_block_from_buffer(self, index, offset, length_of_block):
+        """
+        returns requested block from buffer
+        """
+        row = self.pbuffer.piece_info[index]['row']
+        block = self.pbuffer.buffer[row][offset:length_of_block].tobytes()
+        return block
+
+    @asyncio.coroutine
+    def send_piece_msg(self, peer, msgd):
+        index = msgd['index']
+        begin = msgd['begin']
+        block_length = msgd['length']
+        msg = self.make_piece_msg(index, begin, block_length)
+        try:
+            peer.writer.write(msg)
+            yield from peer.writer.drain()
+        except Exception as e:
+            print('send_piece_msg: error in writing msg to {} index {} begin {}'\
+                .format(peer.address[0], index, begin))
+            logging.debug('send_piece_msg: error in writing msg to {} index {} begin {}'\
+                .format(peer.address[0], index, begin))
+            raise e
+
 
     def is_block_received(self, index, begin):
         """
@@ -981,6 +1012,11 @@ class Client(object):
             block_num = self.get_block_num(begin)
             return (block_bitfield >> block_num) % 2 == 1 # block bit is a 1
         else:
+            # block is not part of completed piece and is not in buffer
+            print('block has never been received or even registered! index {} block {} offset {}'\
+                .format(index, block_num, begin))
+            logging.debug('block has never been received or even registered! index {} block {} offset {}'\
+                .format(index, block_num, begin))
             return False
 
     def get_block_num(self, begin):
@@ -1058,12 +1094,14 @@ class Client(object):
 
 
     def send_have_msg(self, piece_index):
+        """
+        this is not a coroutine, so I am not using yield from with writer
+        """
         msg = self.make_have_msg(piece_index)
         for ipx, peerx in self.open_peers().items():
             if not peerx.has_piece(piece_index):
                 try:
                     peerx.writer.write(msg)
-                    #yield from peerx.writer.drain()  # don't understand why this doesn't work
                 except Exception as e:
                     print(e.args)
                     logging.debug('rcv_piece_msg::done error in writing Have to {}'.format(ipx))
@@ -1076,6 +1114,22 @@ class Client(object):
             else:
                 # peer already has piece
                 pass
+
+    def send_choke_msg(self, peer):
+        try:
+            peer.writer.write(CHOKE)
+        except Exception as e:
+            print('send_choke_msg: {}'.format(e.args))
+            logging.debug('send_choke_msg: {}'.format(e.args))
+            raise e
+
+    def send_unchoke_msg(self, peer):
+        try:
+            peer.writer.write(UNCHOKE)
+        except Exception as e:
+            print('send_unchoke_msg: {}'.format(e.args))
+            logging.debug('send_unchoke_msg: {}'.format(e.args))
+            raise e
 
     def check_msg_for_handshake(self, peer, buf):
         """
@@ -1124,7 +1178,30 @@ class Client(object):
             ident = HANDSHAKE_ID  # identifies handshake
             return ident
 
+    def check_request_msg(self, msgd):
+        """
+        msgd: dictionary containing values in msg
+        """
+        length = msgd['length']
+        ident = msgd['id']
+        index = msgd['index']
+        begin = msgd['begin']
+        block_length = msgd['block_length']
+        # check if begin + block_length > piece_length
+        if index == self.torrent.LAST_PIECE_INDEX:
+            # last piece
+            piece_length = self.last_piece_length
+        else:
+            piece_length = self.piece_length
+        try:
+            assert begin + block_length < piece_length
+        except AssertionError as e:
+            print('check_request_msg: {}'.format(e.args))
+            logging.debug('check_request_msg: {}'.format(e.args))
+            raise ProtocolError('check_request_msg: begin + block_length \
+            exceeds piece length index {}'.format(index))
 
+    @asyncio.coroutine
     def process_read_msg(self, peer, msg):
         """process incoming msg from peer - protocol state machine
         
@@ -1206,6 +1283,21 @@ class Client(object):
                                         .format(length))
             peer.timer = datetime.datetime.utcnow()
             peer.bt_state.interested = 1  # peer is interested in client
+            # unchoke peer
+            if self.number_unchoked_peers < MAX_UNCHOKED_PEERS:
+                self.send_unchoke_msg(peer)
+                self.number_unchoked_peers += 1
+                print('process_read_msg: sent unchoke msg to {} number unchoked peers {}'\
+                    .format(ip, self.number_unchoked_peers))
+                logging.debug('process_read_msg: sent unchoke msg to {} number unchoked peers {}'\
+                    .format(ip, self.number_unchoked_peers))
+            else:
+                # choke an unchoked peer to unchoke this one
+                # or do nothing
+                print('process_read_msg: number of unchoked peers is {}'\
+                    .format(MAX_UNCHOKED_PEERS))
+                logging.debug('process_read_msg: number of unchoked peers is {}'\
+                    .format(MAX_UNCHOKED_PEERS))
         elif ident == 3:
             #  not interested message
             length = self._4bytes_to_int(buf[0:4])
@@ -1216,6 +1308,11 @@ class Client(object):
                                         .format(length))
             peer.timer = datetime.datetime.utcnow()
             peer.bt_state.interested = 0  # peer is not interested in client
+            # send peer Choke msg
+            if peer.bt_state.choked == 0: # unchoked
+                self.send_choke_msg(peer)
+                self.number_unchoked_peers -= 1
+
         elif ident == 4:
             #  have message
             try:
@@ -1247,8 +1344,19 @@ class Client(object):
             self.channel_state[ip].state = 4  # peer sends bitfield message
         elif ident == 6:
             #  request message
-            peer.timer = datetime.datetime.utcnow() 
-            pass # peer requests block from client
+            peer.timer = datetime.datetime.utcnow()
+            msgd = self.rcv_request_msg(buf)
+            # check request message
+            try:
+                self.check_request_msg(msgd)
+            except Exception as e:
+                raise ProtocolError
+             
+            # peer requests block from client
+            if peer.bt_state.interested and not peer.bt_state.choked:
+                # send piece msg
+                yield from self.send_piece_msg(peer, msgd)
+
         elif ident == 7:
             #  piece message
             peer.timer = datetime.datetime.utcnow()
@@ -1455,9 +1563,8 @@ class Client(object):
                 logging.debug("connect_to_peer: {}: reading bitfield/have {}".format(ip, e.args))
                 self._close_peer_connection(peer)
             except Exception as e:
-                print(e.args)
                 logging.debug('connect_to_peer:  {}: reading bitfield/have {}'.format(ip, e.args))
-                print('connect_to_peer:  {}: error in reading {}'.format(ip, bt_messages[msg_ident]))
+                print('connect_to_peer:  {}: error in reading bitfield/have'.format(ip, e.args))
                 self._close_peer_connection(peer)
             
             logging.debug("connect_to_peer: {}: successfully read {}".format(ip, bt_messages[msg_ident]))
@@ -1695,30 +1802,29 @@ class Client(object):
         ip, _ = peer.address
         try:
             # read Handshake from peer
-            logging.debug('about to readexactly 68 handshake bytes')
-            print('about to readexactly 68 handshake bytes from {}'.format(peer.address[0]))
+            logging.debug('_read_handshake: about to readexactly 68 handshake bytes')
+            print('_read_handshake: about to readexactly 68 handshake bytes from {}'.format(ip))
             msg_hs = yield from peer.reader.readexactly(68)      # read handshake msg
         except (ConnectionError, ProtocolError, ConnectionResetError) as e:
-            logging.debug('_read_handshake {} Not ConnectionResetError'.format(peer.address[0]))
+            logging.debug('_read_handshake {} Not ConnectionResetError'.format(ip))
             print(e)
             self._close_peer_connection(peer)
         except Exception as e:
-            logging.debug('_read_handshake {} Other Exception'.format(peer.address[0]))
-            print(e)
+            logging.debug('_read_handshake {} Other Exception'.format(ip))
+            print('_read_handshake {} Other Exception'.format(ip))
             self._close_peer_connection(peer)
-        else:
-            # received Handshake from peer
-            msg_ident = self.process_read_msg(peer, msg_hs)
-            print('received {} from peer {} channel state: {}'\
-                .format(bt_messages[msg_ident], ip, self.channel_state[ip].state))
-            return msg_ident
+        # received Handshake from peer
+        msg_ident = yield from self.process_read_msg(peer, msg_hs)
+        print('received {} from peer {} channel state: {}'\
+            .format(bt_messages[msg_ident], ip, self.channel_state[ip].state))
+        return msg_ident
                              
     @asyncio.coroutine
     def read_peer(self, peer):
         """
         reads msg from peer and processes it
 
-        exceptions are re-raised to the calling function (connect_to_peer)
+        exceptions are re-raised to the calling function
         """
         ip, _ = peer.address
         reader = peer.reader
@@ -1727,7 +1833,8 @@ class Client(object):
         print('in read_peer')
         
         if self.channel_state[ip].open == 1 and self.channel_state[ip].state == 1:
-            logging.info('read_peer: read Handshake from {}'.format(ip))
+            logging.debug('read_peer: to read Handshake from {}'.format(ip))
+            print('read_peer: to read Handshake from {}'.format(ip))
             try: 
                 msg_ident = yield from self._read_handshake(peer)
 
@@ -1776,7 +1883,7 @@ class Client(object):
                 if msg_ident in list(range(10)) or msg_ident == KEEPALIVE_ID:
 
                     # processing the read msg happens here
-                    self.process_read_msg(peer, msg_length + msg_body)
+                    yield from self.process_read_msg(peer, msg_length + msg_body)
 
                     print('read_peer: received {} from peer {} channel state: {}'\
                         .format(bt_messages[msg_ident], \
@@ -1860,6 +1967,7 @@ if __name__ == "__main__":
 
                 #tasks_get_piece = [client.get_piece(index, peer) for index, peers in client.select_piece() for peer in peers]
                 
+                # each task gets blocks for a piece from a distinct peer
                 tasks_get_piece = []
                 result = client.select_piece() # stores [piece, set-of-peers] in attr
                 if result == 'success':
@@ -1883,10 +1991,20 @@ if __name__ == "__main__":
                     client.shutdown()
                     raise e
 
+    # finished downloading torrent
+    # at this point, client is a seeder
+    while client.open_peers():
+        # client listens to already opened connections
+        # when these close, client is done
+        print('client is now a seeder')
+        logging.debug('client is now a seeder')
+        break
+
 
     # download complete
     client.TRACKER_EVENT='completed'
     client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
+
 
     # client shutdown
     client.shutdown()
