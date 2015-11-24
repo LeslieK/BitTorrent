@@ -433,6 +433,7 @@ class Client(object):
     def shutdown(self):
         """
         shutdown each open peer
+        close each open file
         """
         # shutdown client
         print('client is shutting down...')
@@ -440,6 +441,7 @@ class Client(object):
 
         # close all open files
         self._close_fds()
+        print('closed all open files...')
 
         success = all([self._close_peer_connection(peer) for ip, peer in self.open_peers().items()])
         if success:
@@ -1159,7 +1161,7 @@ class Client(object):
             logging.debug('send_unchoke_msg: {}'.format(e.args))
             raise e
 
-    def check_msg_for_handshake(self, peer, buf):
+    def check_handshake_msg(self, peer, buf):
         """
         buf: bytearray(msg)
         """
@@ -1174,9 +1176,9 @@ class Client(object):
             try:
                 assert buf[0] == 19
             except AssertionError as e:
-                print("check_msg_for_handshake: received handshake\
+                print("check_handshake_msg: received handshake\
                 msg with length {}; should be 19".format(buf[0].decode()))
-                raise ConnectionError("check_msg_for_handshake: \
+                raise ConnectionError("check_handshake_msg: \
                 received handshake msg with length {}; should be 19"\
                     .format(buf[0].decode()))
             #  handshake message
@@ -1185,9 +1187,9 @@ class Client(object):
                 # check info_hash
                 assert msgd['info_hash'] == self.torrent.INFO_HASH
             except AssertionError as e:
-                print("check_msg_for_handshake: peer is not part of torrent:\
+                print("check_handshake_msg: peer is not part of torrent:\
                 expected hash: {}".format(self.torrent.INFO_HASH))
-                raise ConnectionError("check_msg_for_handshake: \
+                raise ConnectionError("check_handshake_msg: \
                 peer is not part of torrent: expected hash: {}"\
                     .format(self.torrent.INFO_HASH))
             if self.channel_state[ip].state == 1:
@@ -1259,7 +1261,7 @@ class Client(object):
         
         # check for handshake
         try:
-            ident = self.check_msg_for_handshake(peer, buf)
+            ident = self.check_handshake_msg(peer, buf)
         except (ConnectionError, ProtocolError) as e:
             print('received Handshake msg with errors')
             raise e
@@ -1525,11 +1527,6 @@ class Client(object):
             msg = yield from self.read_peer_for_upload(peer)
             pass
 
-    def read_peer_for_upload(self, peer):
-        """
-        read and send messages to peer in order to upload pieces to it
-        """
-
     @asyncio.coroutine
     def close_quiet_connections(self, peer):
         """
@@ -1551,18 +1548,6 @@ class Client(object):
             peer._client_keepalive_timer = datetime.datetime.utcnow()
             logging.debug('wrote KEEPALIVE to {}'.format(peer.address[0]))
             print('wrote KEEPALIVE to {}'.format(peer.address[0]))
-
-    @asyncio.coroutine
-    def connect_from_peer(self, peer):
-        """
-        This is for peers that are added to swarm after client
-        becomes a seeder.
-
-        peer initiates handshake
-        client responds with handshake to peer
-        client sends bitfield
-        """
-        pass
           
     @asyncio.coroutine
     def connect_to_peer(self, peer):
