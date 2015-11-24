@@ -60,14 +60,14 @@ class ProtocolError(Exception):
     pass
 
 class BTState:
-    def __init__(self):
-        self.choked = 1
-        self.interested = 0
+    def __init__(self, choked=1, interested=0):
+        self.choked = choked
+        self.interested = interested
 
 class ChannelState:
-    def __init__(self):
-        self.open = 0
-        self.state = 0
+    def __init__(self, open=0, state=0):
+        self.open = open
+        self.state = state
 
 bt_messages = {0: 'Choke',
                1: 'Unchoke',
@@ -426,9 +426,86 @@ class Client(object):
         self.selected_piece_peer = [] # [piece_index, peer] NOT USED since refactoring
         self.selected_piece_peers = [] # [piece_index, <set of peers>]
 
-        # used by uploader
+        # used by server (uploader)
         self.number_unchoked_peers = 0
-        self.channel_state_upload = {} # {ip: state} state=0
+        self.server_state = {} # {ip: state} state=0
+
+    def process_server_read(self, peer, msg):
+
+        buf = bytearray(msg)
+        ident = buf[4]
+        ip, _ = peer.address
+
+        if ident == HANDSHAKE_ID:
+            # handshake msg
+            pass
+        elif ident == 0:
+            #  server reads Choke
+            length = self._4bytes_to_int(buf[0:4])
+            try:
+                assert length == 1
+            except AssertionError:
+                raise ConnectionError("Choke: bad length  received: {} expected: 1"\
+                                        .format(length))
+            peer.timer = datetime.datetime.utcnow()
+            self.bt_state[ip].choked = 1  # peer chokes client (self)
+        elif ident == 1:
+            # server reads Unchoke
+            peer.timer = datetime.datetime.utcnow()
+            self.bt_state[ip].choked = 0  # peer chokes client (self)
+        elif ident == 2:
+            # server reads Interested
+            peer.timer = datetime.datetime.utcnow()
+            peer.bt_state.interested = 1
+            if self.server[ip].state == 2:
+                self.server[ip].state = 4
+            elif self.server[ip] == 3:
+                self.server[ip].state = 5
+        elif ident == 3:
+            # server reads Not Interested
+            peer.timer = datetime.datetime.utcnow()
+            peer.bt_state.interested = 0
+            if self.server[ip].state == 4:
+                self.server[ip].state = 2
+            elif self.server[ip] == 5:
+                self.server[ip].state = 3
+        elif ident == 4:
+            # server reads Have
+            peer.timer = datetime.datetime.utcnow()
+            self.rcv_have_msg(ip, buf) # udpates data structures
+
+
+    def process_server_write(self, peer, msg):
+        buf = bytearray(msg)
+        ident = buf[4]
+        ip, _ = peer.address
+
+        if ident == 5:
+            # wrote bitfield msg
+            self.server_state[ip].state = 2
+            peer._client_keepalive_timer = datetime.datetime.utcnow()
+        elif ident == 0:
+            # wrote choke msg
+            peer.bt_state.choked = 1
+            peer._client_keepalive_timer = datetime.datetime.utcnow()
+            if self.server[ip].state == 3:
+                self.server[ip].state = 2
+            elif self.server[ip].state == 5:
+                self.server[ip].state = 4
+        elif ident == 1:
+            # wrote unchoke msg
+            peer.bt_state.choked = 0
+            peer._client_keepalive_timer = datetime.datetime.utcnow()
+            if self.server[ip].state == 2:
+                self.server[ip].state = 3
+            elif self.server[ip].state == 4:
+                self.server[ip].state = 5
+        elif ident == 7:
+            # wrote piece msg
+            if self.server[ip].state == 6:
+                self.server[ip].state = 5
+
+
 
     def shutdown(self):
         """
@@ -549,8 +626,6 @@ class Client(object):
             for ip in dict_of_peers if ip not in self.bt_state})
         self.channel_state.update({ip: ChannelState() \
             for ip in dict_of_peers if ip not in self.channel_state})
-        self.channel_state_upload.update({ip: 0 \
-            for ip in dict_of_peers if ip not in self.channel_state_upload})
         # after a peer channel transitions from open to close, it is removed from active_peers
         # initially, a peer is in active_peers with channel closed
         self.active_peers.update({ip: dict_of_peers[ip] \
@@ -572,7 +647,6 @@ class Client(object):
         ip, _ = peer.address
         # close channel state
         del self.channel_state[ip]
-        del self.channel_state_upload[ip]
         del self.bt_state[ip]
         del self.active_peers[ip]
         self.num_peers = len(self.active_peers)
@@ -597,7 +671,6 @@ class Client(object):
         peer.writer = writer
         self.channel_state[ip].open = 1
         self.channel_state[ip].state = 1
-        self.channel_state_upload[ip] = 1
         logging.debug('write Handshake to {}'.format(ip))
         print('write Handshake to {}'.format(ip))
         peer.writer.write(self.HANDSHAKE)
@@ -702,17 +775,13 @@ class Client(object):
 
     def int_to_bitstring(self):
         """bitfield is an int
-        bitfield: 0xb1---- ---- (ignore leftmost 1)
+        bitfield: 0b1---- ---- (ignore leftmost 1)
         return a bitstring
         """    
         bitstring = bin(self.bitfield)[2:]
-        try:
-            assert len(bitstring) % 8 == 1
-        except AssertionError as e:
-            print(e.args)
         num_bytes = math.ceil(len(bitstring) / 8)
         bitfield_bytes = (self.bitfield).to_bytes(num_bytes, byteorder='big')
-        return bitfield_bytes[1:] # leftmost 1 is ignored here
+        return bitfield_bytes[1:] # leftmost byte is 1 and is ignored
 
     def _int_to_4bytes(self, piece_index):
         payload = bin(piece_index)[2:].encode()
@@ -728,18 +797,18 @@ class Client(object):
         b = bytearray(bytes)
         return b[0]*256**3 + b[1]*256**2 + b[2]*256 + b[3]
 
-    def make_bitfield_msg(self):
-        """convert self.bitfield from int to a bit string"""
-        num_bytes = math.ceil(self.torrent.number_pieces / 8)
-        length = self._int_to_4bytes(num_bytes)
-        ident = b'5'
-        bitfield = self.int_to_bitstring(self.bitfield)
-        return length + ident + bitfield
-
     def get_indices(self, bitfield):
         b = bytearray(bitfield)
         b = ''.join([bin(x)[2:] for x in b])
         return {i for i, x in enumerate(b) if x == '1'}
+
+    def make_bitfield_msg(self):
+        """convert self.bitfield from int to a bit string"""
+        num_bytes = math.ceil(self.torrent.number_pieces / 8)
+        length = self._int_to_4bytes(num_bytes) + 1
+        ident = bytes([5])
+        bitfield = self.int_to_bitstring(self.bitfield)
+        return length + ident + bitfield
 
     def make_have_msg(self, piece_index):
         """
@@ -772,11 +841,11 @@ class Client(object):
         num_bytes = self._int_to_4bytes(block_len)       
         return length + ident + index + begin + num_bytes
 
-    def make_piece_msg(self, piece_index, begin_offset, block_size=MAX_BLOCK_SIZE):
+    def make_piece_msg_from_file(self, piece_index, begin_offset, block_size=MAX_BLOCK_SIZE):
         # convert piece_index to (file_index, offset) to get bytes from appropriate file
         file_index, offset = _piece_index_to_file_index(piece_index)
 
-        ident = b'7'
+        ident = bytes[7]
         begin = _int_to_4bytes(begin_offset)
         index = _int_to_4bytes(piece_index)
 
@@ -785,11 +854,19 @@ class Client(object):
         length = 9 + len(ablock)
         return length + ident + index + begin + ablock
 
-    def rcv_handshake_msg(self, buf):
+    def make_piece_msg(index, begin, length_of_block):
+        length = self._int_to_4bytes(9 + length_of_block)
+        ident = bytes([7])
+        piece_index = self._int_to_4bytes(index)
+        offset = self._int_to_4bytes(begin)
+        block = self._get_block_from_buffer(index, begin, length_of_block)
+        return length + ident + piece_index + offset + block
+
+    def _parse_handshake_msg(self, buf):
         """buf is a bytearray of the msg bytes"""
         msgd = {}
         msgd['pstrlen'] = buf[0]
-        msgd['pstr'] = b'BitTorrent protocol'
+        msgd['pstr'] = buf[1:20]
         msgd['reserved'] = buf[20:28]
         msgd['info_hash'] = buf[28:48]
         msgd['peer_id'] = buf[48:68]
@@ -832,29 +909,6 @@ class Client(object):
             most_common: {}'.format(ip, self.piece_cnts, most_common))
             return 'need more pieces'
 
-        #if most_common:
-        #    # pieces that client needs
-        #    # select least common first
-        #    for i in range(1, len(most_common) + 1):
-        #        index, cnt = most_common[-i] # the real code
-        #        #index, cnt = most_common[i]  # for testing purposes
-        #        ips = list(set(self.channel_state.keys()).intersection(self.piece_to_peers[index]))
-        #        if ips:
-        #            # set of open peers with selected piece
-        #            ip = random.choice(ips)
-        #            self.selected_piece_peer = [index, self.active_peers[ip]]
-        #            return 'success'
-        #    # no open connections with pieces (all open connections have shut down) 
-        #    return 'no open connections'
-        #else:
-        #    # no pieces left in self.piece_cnts
-        #    print('_get_next_piece: no pieces left in piece_cnts')
-        #    logging.debug('_get_next_piece: {} piece_cnts: {}  \
-        #    most_common: {}'.format(ip, self.piece_cnts, most_common))
-        #    print('_get_next_piece: {} piece_cnts: {}  \
-        #    most_common: {}'.format(ip, self.piece_cnts, most_common))
-        #    return 'need more pieces'
-
     def all_pieces(self):
         return len(self.pbuffer.completed_pieces) == self.torrent.number_pieces
 
@@ -876,7 +930,6 @@ class Client(object):
         # update data structures
         self.active_peers[ip].has_pieces.add(index)
         self.piece_to_peers[index].add(ip)
-        #self.peer_to_pieces[ip].add(msgd['piece index'])
         if index not in self.pbuffer.completed_pieces:
             self.piece_cnts[index] += 1
         return msgd
@@ -984,13 +1037,6 @@ class Client(object):
             pass
         return result
 
-    def make_piece_msg(index, begin, length_of_block):
-        length = self._int_to_4bytes(9 + length_of_block)
-        ident = bytes([7])
-        piece_index = self._int_to_4bytes(index)
-        offset = self._int_to_4bytes(begin)
-        block = self._get_block_from_buffer(index, begin, length_of_block)
-        return length + ident + piece_index + offset + block
 
     def _get_block_from_buffer(self, index, offset, length_of_block):
         """
@@ -1016,8 +1062,6 @@ class Client(object):
                 .format(peer.address[0], index, begin))
             raise e
         
-
-
     def is_block_received(self, index, begin):
         """
         True if block from piece index has already been received
@@ -1039,25 +1083,6 @@ class Client(object):
 
     def get_block_num(self, begin):
         return begin // BLOCK_SIZE
-
-    #def _new_offset(self, piece_index, begin):
-    #    """
-    #    begin: begin value from piece msg
-    #    length: length value from piece msg
-    #    returns next offset value for this piece_index
-    #    """
-    #    if piece_index == self.torrent.LAST_PIECE_INDEX:
-    #        block_num = begin // BLOCK_SIZE
-    #        if block_num  == self.last_piece_number_blocks - 1:
-    #            # begin is offset of last block of last piece
-    #            next_offset = 0
-    #        else:
-    #            # begin is offset of non-last-block of last piece
-    #            next_offset = begin + BLOCK_SIZE 
-    #    else:
-    #        # piece is not last piece
-    #        next_offset = (begin + BLOCK_SIZE) % self.piece_length
-    #    return next_offset
 
     def _get_next_offset(self, piece_index, offset):
         """
@@ -1122,7 +1147,6 @@ class Client(object):
         msgd['block'] = buf[13:]
         return msgd
 
-
     def send_have_msg(self, piece_index):
         """
         this is not a coroutine, so I am not using yield from with writer
@@ -1137,8 +1161,6 @@ class Client(object):
                     logging.debug('rcv_piece_msg::done error in writing Have to {}'.format(ipx))
                     print('rcv_piece_msg::done error in writing Have to {}'.format(ipx))
                     raise e
-                #if self.channel_state_upload[ipx] == 1:
-                #    self.channel_state_upload[ipx] = 2
                 print('rcv_piece_msg::done successfully wrote Have msg to {}'.format(ipx))
                 logging.debug('rcv_piece_msg::done successfully wrote Have msg to {}'.format(ipx))
             else:
@@ -1182,7 +1204,7 @@ class Client(object):
                 received handshake msg with length {}; should be 19"\
                     .format(buf[0].decode()))
             #  handshake message
-            msgd = self.rcv_handshake_msg(buf)
+            msgd = self._parse_handshake_msg(buf)
             try:
                 # check info_hash
                 assert msgd['info_hash'] == self.torrent.INFO_HASH
@@ -1192,8 +1214,6 @@ class Client(object):
                 raise ConnectionError("check_handshake_msg: \
                 peer is not part of torrent: expected hash: {}"\
                     .format(self.torrent.INFO_HASH))
-            if self.channel_state[ip].state == 1:
-                self.channel_state[ip].state = 2
 
             # Note: check peer_id
             # check that peer.peer_id from tracker_response['peers'] (dictionary model)
@@ -1251,7 +1271,7 @@ class Client(object):
         """process incoming msg from peer - protocol state machine
         
         peer: peer instance
-        msg: bit torrent msg
+        msg: bittorrent msg
         """
         if not msg:
             return
@@ -1263,9 +1283,11 @@ class Client(object):
         try:
             ident = self.check_handshake_msg(peer, buf)
         except (ConnectionError, ProtocolError) as e:
-            print('received Handshake msg with errors')
+            print('process_read_msg: received Handshake msg with errors')
             raise e
-        if ident==HANDSHAKE_ID:
+        if ident == HANDSHAKE_ID: # could be False or HANDSHAKE_ID
+            if self.channel_state[ip].state == 1:
+                self.channel_state[ip].state = 2
             return ident
 
         ident = buf[4]
@@ -1515,17 +1537,59 @@ class Client(object):
             raise ProtocolError("Client wrote Unknown message ident: {}".format(ident))
 
     @asyncio.coroutine
-    def upload_to_peer(self, peer):
+    def handle_leecher(self, reader, writer):
         """
-        run uploader state machine on an already-opened connection
+        run uploader state machine on a leecher that connects to client
         """
-        ip, _ = peer.address
-        if self.channel_state_upload[ip] > 1:
-            # define upload channel state machine
+        # get peer address
+        ip, port = writer.get_extra_info('peername')
+        peer = Peer(self.torrent, ip)
 
-            # wait for Interested msg
-            msg = yield from self.read_peer_for_upload(peer)
-            pass
+        # expect Handshake
+        try:
+            msg = yield from reader.readexactly(68)
+        except Exception as e:
+            print('handle_leecher: {}'.format(e.args))
+            logging.debug('handle_leecher: {}'.format(e.args))
+
+        try:
+            buf = bytearray(msg)
+            msg_ident = self.check_handshake_msg(peer, buf)
+        except ConnectionError as e:
+            print('handler_leecher: ConnectionError: Received Handshake msg \
+            with errors from ip {} {}'.format(ip, e.args))
+        except Exception as e:
+            print('handler_leecher: Other Exception reading Handshake msg \
+            from ip {} {}'.format(ip, e.args))
+
+        if msg_ident == HANDSHAKE_ID:
+            self.active_peers.update({ip: peer})  # add open peer to active_peers
+            self.channel_state[ip] = ChannelState(open=1, state=1)
+            self.bt_state[ip] = BTState() # choked = 1, interested = 0
+            self.process_server_read(peer, buf)
+        else:
+            raise ProtocolError('handle_leecher: first msg must be Handshake')
+
+        # write handshake msg
+        self.writer.write(self.HANDSHAKE)
+        self.channel_state[ip].state = 2
+
+        # write bitfield msg
+        msg = self.make_bitfield_msg()
+        self.writer.write(msg)
+        self.process_server_write(peer, msg)
+
+        #while True:
+        #    try:
+        #        msg = yield from self.server_read_peer(peer)
+        #    except Exception as e:
+        #        print(e.args)
+        #        raise ConnectionError(e.args)
+
+
+
+        
+
 
     @asyncio.coroutine
     def close_quiet_connections(self, peer):
@@ -1851,11 +1915,11 @@ class Client(object):
         except (ConnectionError, ProtocolError, ConnectionResetError) as e:
             logging.debug('_read_handshake {} Not ConnectionResetError'.format(ip))
             print(e)
-            self._close_peer_connection(peer)
+            raise e
         except Exception as e:
             logging.debug('_read_handshake {} Other Exception'.format(ip))
             print('_read_handshake {} Other Exception'.format(ip))
-            self._close_peer_connection(peer)
+            raise e
         # received Handshake from peer
         msg_ident = yield from self.process_read_msg(peer, msg_hs)
         print('received {} from peer {} channel state: {}'\
@@ -1949,7 +2013,7 @@ class Peer(object):
         self.reader = None
         self.writer = None
         # bt_state = choked by client, interested in client
-        self.bt_state = BTState()
+        self.bt_state = BTState() # choked = 1, interested = 0
         # peer keepalive timer (reset when client receives msg from peer)
         self._timer = datetime.datetime.utcnow() 
         # client keepalive timer (reset when client sends msg to peer)
@@ -2023,9 +2087,13 @@ if __name__ == "__main__":
                     # no pieces in open peers
                     # connect to tracker
                     break
+
+                # creating listening task (a coroutine) that listens for new leechers joining swarm
+                task_server = [asyncio.start_server(client.handle_leecher, host='192.68.0.132', port=58095, loop=loop)]
                         
                 try:
-                    loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
+                    loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive+task_server))
+                    #loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
                 except KeyboardInterrupt as e:
                     print(e.args)
                     client.shutdown()
