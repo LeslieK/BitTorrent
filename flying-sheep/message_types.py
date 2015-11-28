@@ -430,81 +430,6 @@ class Client(object):
         self.number_unchoked_peers = 0
         self.server_state = {} # {ip: state} state=0
 
-    def process_server_read(self, peer, msg):
-
-        buf = bytearray(msg)
-        ident = buf[4]
-        ip, _ = peer.address
-
-        if ident == HANDSHAKE_ID:
-            # handshake msg
-            pass
-        elif ident == 0:
-            #  server reads Choke
-            length = self._4bytes_to_int(buf[0:4])
-            try:
-                assert length == 1
-            except AssertionError:
-                raise ConnectionError("Choke: bad length  received: {} expected: 1"\
-                                        .format(length))
-            peer.timer = datetime.datetime.utcnow()
-            self.bt_state[ip].choked = 1  # peer chokes client (self)
-        elif ident == 1:
-            # server reads Unchoke
-            peer.timer = datetime.datetime.utcnow()
-            self.bt_state[ip].choked = 0  # peer chokes client (self)
-        elif ident == 2:
-            # server reads Interested
-            peer.timer = datetime.datetime.utcnow()
-            peer.bt_state.interested = 1
-            if self.server[ip].state == 2:
-                self.server[ip].state = 4
-            elif self.server[ip] == 3:
-                self.server[ip].state = 5
-        elif ident == 3:
-            # server reads Not Interested
-            peer.timer = datetime.datetime.utcnow()
-            peer.bt_state.interested = 0
-            if self.server[ip].state == 4:
-                self.server[ip].state = 2
-            elif self.server[ip] == 5:
-                self.server[ip].state = 3
-        elif ident == 4:
-            # server reads Have
-            peer.timer = datetime.datetime.utcnow()
-            self.rcv_have_msg(ip, buf) # udpates data structures
-
-
-    def process_server_write(self, peer, msg):
-        buf = bytearray(msg)
-        ident = buf[4]
-        ip, _ = peer.address
-
-        if ident == 5:
-            # wrote bitfield msg
-            self.server_state[ip].state = 2
-            peer._client_keepalive_timer = datetime.datetime.utcnow()
-        elif ident == 0:
-            # wrote choke msg
-            peer.bt_state.choked = 1
-            peer._client_keepalive_timer = datetime.datetime.utcnow()
-            if self.server[ip].state == 3:
-                self.server[ip].state = 2
-            elif self.server[ip].state == 5:
-                self.server[ip].state = 4
-        elif ident == 1:
-            # wrote unchoke msg
-            peer.bt_state.choked = 0
-            peer._client_keepalive_timer = datetime.datetime.utcnow()
-            if self.server[ip].state == 2:
-                self.server[ip].state = 3
-            elif self.server[ip].state == 4:
-                self.server[ip].state = 5
-        elif ident == 7:
-            # wrote piece msg
-            if self.server[ip].state == 6:
-                self.server[ip].state = 5
-
 
 
     def shutdown(self):
@@ -1415,7 +1340,7 @@ class Client(object):
             try:
                 self.check_request_msg(msgd)
             except Exception as e:
-                raise ProtocolError
+                raise ProtocolError('check_request_msg: {}'.format(e.args))
              
             # peer requests block from client
             if peer.bt_state.interested and not peer.bt_state.choked:
@@ -1424,7 +1349,7 @@ class Client(object):
                     yield from self.send_piece_msg(peer, msgd)
                 except Exception as e:
                     self._close_peer_connection(peer)
-                peer.number_bytes_uploaded += msgd['length']
+                peer.number_bytes_uploaded += msgd['length']  # peer sends request message
 
         elif ident == 7:
             #  piece message
@@ -1536,14 +1461,34 @@ class Client(object):
             print("Client wrote Unknown message ident: {}".format(ident))
             raise ProtocolError("Client wrote Unknown message ident: {}".format(ident))
 
+    def process_server_read(self, peer, msg):
+        """
+        runs state machine on incoming connections
+        """
+        pass
+
+    def process_server_write(self, peer, msg):
+        """
+        runs state machine on incoming connections
+        """
+        pass
+
     @asyncio.coroutine
     def handle_leecher(self, reader, writer):
         """
-        run uploader state machine on a leecher that connects to client
+        listen for leechers
+        read Handshake, write Handshake, write bitfield
+
+        client.get_piece() will now have access to these peers
         """
+        
+
         # get peer address
         ip, port = writer.get_extra_info('peername')
-        peer = Peer(self.torrent, ip)
+        peer = Peer(self.torrent, (ip, port))
+
+        print('in handle_leecher peername: {}:{}'.format(ip, port))
+        logging.debug('in handle_leecher peername: {}:{}'.format(ip, port))
 
         # expect Handshake
         try:
@@ -1563,32 +1508,23 @@ class Client(object):
             from ip {} {}'.format(ip, e.args))
 
         if msg_ident == HANDSHAKE_ID:
+            # no! handler peers are not mixed with other peers
             self.active_peers.update({ip: peer})  # add open peer to active_peers
             self.channel_state[ip] = ChannelState(open=1, state=1)
-            self.bt_state[ip] = BTState() # choked = 1, interested = 0
-            self.process_server_read(peer, buf)
+            self.bt_state[ip] = BTState(choked=1, interested=0)
         else:
             raise ProtocolError('handle_leecher: first msg must be Handshake')
 
         # write handshake msg
         self.writer.write(self.HANDSHAKE)
         self.channel_state[ip].state = 2
+        print('handle_leecher: wrote Handshake to {}'.format(ip))
 
         # write bitfield msg
         msg = self.make_bitfield_msg()
         self.writer.write(msg)
-        self.process_server_write(peer, msg)
-
-        #while True:
-        #    try:
-        #        msg = yield from self.server_read_peer(peer)
-        #    except Exception as e:
-        #        print(e.args)
-        #        raise ConnectionError(e.args)
-
-
-
-        
+        peer._client_keepalive_timer = datetime.datetime.utcnow()
+        print('handle_leecher: wrote Bitfield to {}'.format(ip))
 
 
     @asyncio.coroutine
@@ -2031,23 +1967,8 @@ class Peer(object):
         return piece_index in self.has_pieces 
 
 
-########## 
-if __name__ == "__main__":
-    #torrent_obj = TorrentWrapper("Mozart_mininova.torrent")
-    #torrent_obj = TorrentWrapper("Conversations with Google [mininova].torrent")
-    torrent_obj = TorrentWrapper("Trigger Hippy Gorman Herring Freed Govrik - Live in Macon GA [mininova].torrent")
-    BUFFER_SIZE = torrent_obj.number_pieces + 1
-    assert torrent_obj.is_multi_file() == True
-
-    client = Client(torrent_obj)
-    # print(torrent_obj.list_of_file_boundaries())
-
-    loop = asyncio.get_event_loop()
-    loop.set_debug(enabled=True)
-    logging.captureWarnings(capture=True)
-
-    #task_uploader = [client.uploader()]
-    
+@asyncio.coroutine
+def main(client):
     port_index = 0
     while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
         success = client.connect_to_tracker(PORTS[port_index])  # blocking
@@ -2061,7 +1982,8 @@ if __name__ == "__main__":
             #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
             #    for peer in client.active_peers.values()]
             try:
-                loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive))
+                for task in tasks_connect+tasks_keep_alive:
+                    yield from task
             except KeyboardInterrupt as e:
                 print(e.args)
                 client.shutdown()
@@ -2078,54 +2000,107 @@ if __name__ == "__main__":
                 # open peer(s) may have pieces that client needs
                 
                 # each task gets blocks for a piece from a distinct peer
-                tasks_get_piece = []
                 result = client.select_piece() # stores [piece, set-of-peers] in attr
                 if result == 'success':
                     index, peers = client.selected_piece_peers
-                    tasks_get_piece = [client.get_piece(index, peer) for peer in peers]
+                    for peer in peers:
+                        yield from client.get_piece(index, peer)
+                        yield from client.send_keepalive(peer)
+                        #yield from server_coro # listens to joining peers
                 else:
                     # no pieces in open peers
                     # connect to tracker
                     break
-
-                # creating listening task (a coroutine) that listens for new leechers joining swarm
-                task_server = [asyncio.start_server(client.handle_leecher, host='192.68.0.132', port=58095, loop=loop)]
-                        
-                try:
-                    loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive+task_server))
-                    #loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
-                except KeyboardInterrupt as e:
-                    print(e.args)
-                    client.shutdown()
-                    raise e
-                except ValueError as e:
-                    print('main', e.args)
-                    logging.debug('main', e.args)
-                    break
-                except Exception as e:
-                    print(e.args)
-                    client.shutdown()
-                    raise e
-
-    # finished downloading torrent
-    # at this point, client is a seeder
-    while client.open_peers():
-        # client listens to already opened connections
-        # when these close, client is done
-        print('client is now a seeder')
-        logging.debug('client is now a seeder')
-        break
-
-
     # download complete
+    print('all pieces downloaded')
+    print('client is a seeeder')
     client.TRACKER_EVENT='completed'
     client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
 
+########## 
+if __name__ == "__main__":
+    #torrent_obj = TorrentWrapper("Mozart_mininova.torrent")
+    #torrent_obj = TorrentWrapper("Conversations with Google [mininova].torrent")
+    torrent_obj = TorrentWrapper("Trigger Hippy Gorman Herring Freed Govrik - Live in Macon GA [mininova].torrent")
+    BUFFER_SIZE = torrent_obj.number_pieces + 1
+    assert torrent_obj.is_multi_file() == True
 
-    # client shutdown
-    client.shutdown()
+    # print(torrent_obj.list_of_file_boundaries())
 
-    loop.close()
+    client = Client(torrent_obj)
+    port_index = 0  # tracker port
+
+    loop = asyncio.get_event_loop()
+    loop.set_debug(enabled=True)
+    logging.captureWarnings(capture=True)
+
+    server_coro = asyncio.start_server(client.handle_leecher, host='192.168.0.132', port=8000, loop=loop)
+    #server = loop.run_until_complete(coro)
+    #loop.run_until_complete(asyncio.async(main(client)))
+
+    
+
+    #while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
+    #    success = client.connect_to_tracker(PORTS[port_index])  # blocking
+    #    port_index = (port_index + 1) % len(PORTS)  
+        
+    #    if success:
+    #        tasks_connect = [client.connect_to_peer(peer) \
+    #            for peer in client.active_peers.values()]
+    #        tasks_keep_alive = [client.send_keepalive(peer) \
+    #            for peer in client.active_peers.values()]
+    #        #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
+    #        #    for peer in client.active_peers.values()]
+    #        try:
+    #            loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive))
+    #        except KeyboardInterrupt as e:
+    #            print(e.args)
+    #            client.shutdown()
+    #            raise e
+    #        except Exception as e:
+    #            print(e.args)
+    #            client.shutdown()
+    #            raise e
+
+    #        # finished connecting to each peer, now...let's get some pieces
+    #        while client.open_peers() and not client.all_pieces() and client.piece_cnts:
+    #            # at least 1 peer is open and 
+    #            # not all pieces are complete and 
+    #            # open peer(s) may have pieces that client needs
+                
+    #            # each task gets blocks for a piece from a distinct peer
+    #            result = client.select_piece() # stores [piece, set-of-peers] in attr
+    #            if result == 'success':
+    #                index, peers = client.selected_piece_peers
+    #                task_get_piece = [client.get_piece(index, peer) for peer in peers]
+    #                task_keep_alive = [client.send_keepalive(peer) for peer in peers]
+    #                loop.run_until_complete(asyncio.wait(task_get_piece+task_keep_alive))
+    #            else:
+    #                # no pieces in open peers
+    #                # connect to tracker
+    #                break
+    ## download complete
+    #print('all pieces downloaded')
+    #print('client is a seeeder')
+    #client.TRACKER_EVENT='completed'
+    #client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
+
+    #@asyncio.coroutine
+    #def run_client(client):
+    #    yield from main(client)
+        
+    
+
+    try:
+        loop.run_until_complete(asyncio.wait([main(client), server_coro])) # main ends when client downloads all pieces
+        # but server keeps running
+    except KeyboardInterrupt as e:
+        print(e.args)
+    except Exception as e:
+        print(e.args)
+    finally:
+        client.shutdown()
+        loop.close()
 
 
 
