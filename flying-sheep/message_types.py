@@ -24,6 +24,8 @@ logger = logging.getLogger('asyncio')
 logging.basicConfig(filename="bittorrent.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
 logging.captureWarnings(capture=True)
 
+ROOT_DIR = 'c:\\Users\\lbklein\\PROJECTS\\VisualStudio2015Projects\\AsynchIO\\flying-sheep'
+
 DEFAULT_BLOCK_LENGTH = 2**14
 MAX_PEERS = 50
 BLOCK_SIZE = DEFAULT_BLOCK_LENGTH
@@ -130,8 +132,6 @@ class PieceBuffer(object):
         print('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
             .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
 
-        assert self.buffer[row][begin:begin+len(ablock)] == ablock
-
         # update bitfield (each bit represents a block in the piece)
         #self._update_bitfield(piece_index)
         self._update_bitfield(piece_index, begin)
@@ -176,8 +176,9 @@ class PieceBuffer(object):
             self.free_rows.add(row)  # add row to set of available rows
 
     def pieces_in_buffer(self):
-        """returns a generator object that generates indices of pieces in buffer"""
-        return (piece_index for piece_index in self.piece_info.keys())
+        """returns an iterator object that iterates over pieces in buffer"""
+        piece_indices = list(self.piece_info.keys())
+        return iter(piece_indices)
 
     def is_piece_complete(self, piece_index):
         """
@@ -293,10 +294,12 @@ class TorrentWrapper(object):
     def __init__(self, metafile):
         with open(metafile, 'rb') as f:
             self.torrent = bdecode(f)
+
         self.INFO_HASH = sha1_info(self.torrent)
         self.TRACKER_URL = self.announce()
-        self.total_bytes = self.total_file_length()
         self.piece_length = self.torrent['info']['piece length']
+        self.total_bytes = self.total_file_length()
+        
         self.number_pieces = self._num_pieces()
         self.last_piece_length = self._length_of_last_piece()
         self.LAST_PIECE_INDEX = self.number_pieces - 1
@@ -326,7 +329,11 @@ class TorrentWrapper(object):
 
     def total_file_length(self):
         """returns the number of bytes across all files"""
-        return sum([file['length'] for file in self.torrent['info']['files']])
+        if self.is_multi_file():
+            return sum([file['length'] for file in self.torrent['info']['files']])
+        else:
+            # single file
+            return self.torrent['info']['length']
 
     def is_multi_file(self):
         """return True if more than 1 file"""
@@ -356,6 +363,7 @@ class TorrentWrapper(object):
                           'num_pieces': 
                           math.ceil(self.torrent['info']['length']/piece_length)}]
         return file_meta
+        
 
     def list_of_file_boundaries(self):
         """creates a list of file boundaries;
@@ -380,12 +388,6 @@ class Client(object):
     def __init__(self, torrent):
         self.peer_id = my_peer_id()
         self.torrent = torrent
-
-        # file_meta is list of dicts:
-        #if multi-file:
-        #returns [{'length': len1, 'name': dir1/dir2/fileA]}, {'length': len2, 'name': 'fileB'}, ... ]
-        #if single-file:
-        #return [{'length': nn, 'name': filename, 'num_pieces': <number pieces in this file>}]
 
         self.files = self.torrent.file_meta
         self.HANDSHAKE = make_handshake(self.torrent.INFO_HASH, self.peer_id)  
@@ -428,40 +430,65 @@ class Client(object):
 
         # used by server (uploader)
         self.number_unchoked_peers = 0
-        self.server_state = {} # {ip: state} state=0
+        self.server_conn = {} # {ip: peer} # peers initiate connection to client
 
 
 
     def shutdown(self):
         """
+        flush buffer to file
         shutdown each open peer
         close each open file
+        send tracker event='stopped'
         """
-        # shutdown client
-        print('client is shutting down...')
-        logging.debug('client is shutting down...')
+        # flush buffer to file
+        if self.pbuffer.piece_info:
+            # buffer has at least 1 piece
+            logging.debug('shutdown: flushing buffer...')
+            print('shutdown: flushing buffer...')
+
+            self.write_buffer_to_file()
+
+            logging.debug('shutdown: flushed buffer')
+            print('shutdown: flushed buffer')
 
         # close all open files
         self._close_fds()
         print('closed all open files...')
+
+        # shutdown client
+        print('client is shutting down...')
+        logging.debug('client is shutting down...')
 
         success = all([self._close_peer_connection(peer) for ip, peer in self.open_peers().items()])
         if success:
             # successfully closed all open peers
             try:
                 self.TRACKER_EVENT = 'stopped'
-                r = self.connect_to_tracker(PORTS[0], numwant=0, completed=True)
+                # r = self.connect_to_tracker(PORTS[0], numwant=0, completed=True) # mininova tracker is not working today 11/30
             except Exception as e:
                 print('client shutdown error: {}'.format(e.args))
                 logging.debug('client shutdown error: {}'.format(e.args))
-            print('client completed shutdown')
-            logging.debug('client completed shutdown')
+            print('shutdown: client completed shutdown')
+            logging.debug('shutdown: client completed shutdown')
             return True
         else:
             # client did not close all open peers
             print('client shutdown failed')
             logging.debug('client shutdown failed')
             return False
+
+    def _parse_active_peers_for_testing(self, address_list):
+        """
+        use this with a real peer instead of connecting to tracker
+        """
+        ptorrent = self.torrent
+        for address in address_list:
+            ip, port = address
+            self.active_peers[ip] = Peer(ptorrent, address)
+            self.channel_state[ip] = ChannelState()
+            self.bt_state[ip] = BTState()
+        self.num_peers = len(self.active_peers)  # number of open and not-yet-connected-to peers
     
     def connect_to_tracker(self, port, numwant=NUMWANT, completed=False):
         """send GET request; parse self.tracker_response
@@ -493,10 +520,12 @@ class Client(object):
         # blocking
         if self.TRACKER_EVENT:
             http_get_params['event'] = self.TRACKER_EVENT
-            r = requests.get(self.torrent.TRACKER_URL, params=http_get_params)
+        try:
+            r = requests.get(self.torrent.TRACKER_URL, params=http_get_params) # blocking
             self.TRACKER_EVENT = None
-        else:
-            r = requests.get(self.torrent.TRACKER_URL, params=http_get_params)
+        except Exception as e:
+            print(e.args)
+            raise ConnectionError
 
         # reset client's tracker timer
         self.tracker_timer = datetime.datetime.utcnow()
@@ -589,7 +618,8 @@ class Client(object):
         sets channel_state[ip]
         attaches reader, writer to peer object
         """
-        logging.debug('_open_peer_connection to {}'.format(peer.address[0]))       
+        logging.debug('_open_peer_connection to {}'.format(peer.address[0]))
+        print('_open_peer_connection to {}'.format(peer.address[0]))       
 
         ip, _ = peer.address
         peer.reader = reader
@@ -612,6 +642,18 @@ class Client(object):
     def _number_of_bytes_left(self):
         return self.total_files_length - self.num_bytes_downloaded
 
+    def create_dirs_for_pieces(self, multi=True):
+        if multi:
+            results = []
+            for file in self.files:
+                d = os.path.dirname(file['name'])
+                if d and d not in results:
+                    try:
+                        os.makedirs(name=os.path.join(ROOT_DIR, d), exist_ok=False)
+                    except Exception as e:
+                        pass
+                    results += [d]
+
     def open_files(self):
         """
         open files for writing pieces to file
@@ -620,49 +662,62 @@ class Client(object):
         mode r: if file exists
         mode x: if file does not exist
         """
-        fds = [open(file['name'], mode='rb', ) for file in self.files]
+        if self.torrent.is_multi_file():
+            self.create_dirs_for_pieces()
+        fds = []
+        for file in self.files:
+            try:
+                f = open(file['name'], mode='wb')
+            except Exception as e:
+                f = open(file['name'], mode='xb')
+            fds += [f]
         return fds
 
     def write_buffer_to_file(self, piece_index=None):
         """
         write piece in buffer to the filesystem using the pathname
-        row: indicates buffer row (i.e., piece) to write to file
-        start: start byte position wrt piece
-        offset: offset into file from head
-        bytes_left: number of bytes in piece that still need to be written to file
         """
         if piece_index:
             # write 1 piece to buffer
-            self._write_piece_to_file(self, index)
+            self._write_piece_to_file(piece_index)
         else:
             # write entire buffer to file(s)
-            for piece_index in self.pieces_in_buffer():
-                self._write_piece_to_file(self, piece_index)         
+            for piece_index in self.pbuffer.pieces_in_buffer():
+                self._write_piece_to_file(piece_index)         
 
     def _write_piece_to_file(self, piece_index):
-        row = self.pbuffer.piece_info[piece_index]
+        """
+        row: indicates buffer row (i.e., piece) to write to file
+        start: byte position in piece
+        reference: byte position indicating beginning of file
+        offset: start - reference: offset into file from head
+        bytes_left: number of bytes in piece that still need to be written to file
+        """
+        row = self.pbuffer.piece_info[piece_index]['row']
         # write piece to 1 or more files
-        bytes_left = self.piece_length                
+        bytes_left = self._piece_length(piece_index)               
         start = piece_index * self.torrent.piece_length
-        file_index = bisect(self.file_boundaries_by_byte_indices, start)
-        reference = 0 if file_index == 0 else self.file_boundaries_by_byte_indices[file_index]
+        file_index = bisect.bisect(self.torrent.file_boundaries_by_byte_indices, start)
+        reference = 0 if file_index == 0 else self.torrent.file_boundaries_by_byte_indices[file_index]
         offset = start - reference 
 
         while bytes_left > 0:
-            m = min((self.files[file_index]['length'] - offset, 0), (bytes_left, 1))
-            if m[1] == 0:  # bytes_left span multiple files
-                self._write(self.output_fds[file_index], offset, bytes_left - m[0], row)
-                start += bytes_left - m[0]
-                offset = 0
-                bytes_left -= m[0]
+            number_bytes_left_in_file = self.files[file_index]['length'] - offset
+            if bytes_left > number_bytes_left_in_file:
+                # bytes_left span multiple files
+                number_bytes = number_bytes_left_in_file
+                self._write(self.output_fds[file_index], offset, number_bytes, row)
+                start += number_bytes
+                bytes_left -= number_bytes
                 file_index += 1
+                offset = 0
             else:          # bytes_left are in a single file
-                self._write(self.files[file_index], offset, bytes_left, row)
+                self._write(self.output_fds[file_index], offset, bytes_left, row)
                 bytes_left = 0
-        self.pbuffer.reset(piece_index, free_row=True)
+        self.pbuffer.reset(piece_index, free_row=True) # removes piece from buffer
 
-    def _write(self, fd, offset, num_bytes, row):  # bug here: start not a param; offset is the param
-        fd.write(self.buffer[row][start:start+num_bytes])
+    def _write(self, fd, offset, num_bytes, row):  
+        fd.write(self.buffer[row][offset:offset+num_bytes].tobytes())
 
     def _close_fds(self):
         [fd.close() for fd in self.output_fds]
@@ -1349,8 +1404,9 @@ class Client(object):
                     yield from self.send_piece_msg(peer, msgd)
                 except Exception as e:
                     self._close_peer_connection(peer)
-                peer.number_bytes_uploaded += msgd['length']  # peer sends request message
-
+                peer.number_bytes_downloaded += msgd['length']  # peer sends request message
+                self.number_bytes_uploaded += msgd['length']
+                self.process_server_write(peer, msg)
         elif ident == 7:
             #  piece message
             peer.timer = datetime.datetime.utcnow()
@@ -1363,6 +1419,7 @@ class Client(object):
             except Exception as e:
                 print(e.args)
                 raise e
+
             msgd = self._parse_piece_msg(buf)
             if self.channel_state[ip].state == 7:
                 if result == 'done':
@@ -1464,25 +1521,146 @@ class Client(object):
     def process_server_read(self, peer, msg):
         """
         runs state machine on incoming connections
+
+        uploader read msgs:
+
+        Handshake, Bitfield
+        Have
+        Interested, Not Interested
+        Request
+        Cancel
         """
-        pass
+        ip, _ = peer.address
+        buf = bytearray(msg)
+        ident = buf[4]
+
+        if ident == HANDSHAKE_ID:
+            # Handshake msg
+            if peer[ip].download_state == 0:
+                peer[ip].download_state = 1
+        elif ident == 2:
+            # Interested msg
+            
+            length = self._4bytes_to_int(buf[0:4])
+            try: 
+                assert length == 1
+            except AssertionError:
+                raise ConnectionError("Interested: bad length  received: {} expected: 1"\
+                                        .format(length))
+            peer.timer = datetime.datetime.utcnow()
+            peer.bt_state.interested = 1  # peer is interested in client
+            # unchoke peer
+            if self.number_unchoked_peers < MAX_UNCHOKED_PEERS:
+                self.send_unchoke_msg(peer)
+                self.number_unchoked_peers += 1
+                print('process_server_read: sent unchoke msg to {} number unchoked peers {}'\
+                    .format(ip, self.number_unchoked_peers))
+                logging.debug('process_server_read: sent unchoke msg to {} number unchoked peers {}'\
+                    .format(ip, self.number_unchoked_peers))
+            else:
+                # choke an unchoked peer to unchoke this one
+                # or do nothing
+                print('process_read_msg: number of unchoked peers is {}'\
+                    .format(MAX_UNCHOKED_PEERS))
+                logging.debug('process_read_msg: number of unchoked peers is {}'\
+                    .format(MAX_UNCHOKED_PEERS))
+        elif ident == 3:
+            # Not Interested mg
+            length = self._4bytes_to_int(buf[0:4])
+            try: 
+                assert length == 1
+            except AssertionError:
+                raise ConnectionError("Not Interested: bad length  received: {} expected: 1"\
+                                        .format(length))
+            peer.timer = datetime.datetime.utcnow()
+            peer.bt_state.interested = 0  # peer is not interested in client
+            # send peer Choke msg
+            if peer.bt_state.choked == 0: # unchoked
+                self.send_choke_msg(peer)
+                self.number_unchoked_peers -= 1
+                self.process_server_write(peer, CHOKE)
+        elif ident == 6:
+            # Request msg
+            peer.timer = datetime.datetime.utcnow()
+            msgd = self._parse_request_msg(buf)
+
+            # check request message
+            try:
+                self.check_request_msg(msgd)
+            except Exception as e:
+                raise ProtocolError('check_request_msg: {}'.format(e.args))
+
+            if self.server_conn[ip].download_state == 5:
+                self.server_conn[ip].download = 6
+
+            # peer requests block from client
+            if peer.bt_state.interested and not peer.bt_state.choked:
+                # send piece msg
+                try:
+                    yield from self.send_piece_msg(peer, msgd) # client sends piece message
+                except Exception as e:
+                    self._close_peer_connection(peer)
+                peer.number_bytes_downloaded += msgd['length']
+                self.process_server_write(msg)
+        elif ident == 8:
+            # Cancel msg
+            # client must cancel associated request
+            pass
+        else:
+            # ident Unsupported
+            pass  
 
     def process_server_write(self, peer, msg):
         """
         runs state machine on incoming connections
+
+
+
         """
-        pass
+        ip, _ = peer.address
+        buf = bytearray(msg)
+        ident = buf[4]
+
+        if ident == HANDSHAKE_ID:
+            # server wrote Handshake+Bitfield in respose to peer Handshake
+            if self.server_state[ip] == 1:
+                self.server_state[ip] = 2
+            else:
+                raise ProtocolError('process_server_write: client wrote Handshake to ip {} from state {}'\
+                    .format(ip, self.server_state[ip]))
+        elif ident == 0:
+            # server wrote Unchoke msg
+            if self.server_state[ip] == 2:
+                self.server_state[ip] = 3
+            elif self.server_state[ip] == 4:
+                self.server_state[ip] = 5
+        elif ident == 1:
+            # server wrote Choke msg
+            if self.server_state[ip] == 3:
+                self.server_state[ip] = 2
+            elif self.server_state[ip] == 5:
+                self.server_state[ip] = 4
+        elif ident == 4:
+            # server wrote Have msg
+            pass
+        elif ident == 5:
+            # server wrote Bit msg
+            # won't happen; covered in ident=Handshake_ID
+            pass
+        elif ident == 7:
+            # server writes Piece msg
+            # server get bytes from its buffer
+            if self.server_state[ip] == 6:
+                self.server_state[ip] = 5
 
     @asyncio.coroutine
     def handle_leecher(self, reader, writer):
         """
         listen for leechers
-        read Handshake, write Handshake, write bitfield
+        leecher initiates connection
 
-        client.get_piece() will now have access to these peers
+        read Handshake, write Handshake+bitfield
         """
-        
-
         # get peer address
         ip, port = writer.get_extra_info('peername')
         peer = Peer(self.torrent, (ip, port))
@@ -1496,7 +1674,6 @@ class Client(object):
         except Exception as e:
             print('handle_leecher: {}'.format(e.args))
             logging.debug('handle_leecher: {}'.format(e.args))
-
         try:
             buf = bytearray(msg)
             msg_ident = self.check_handshake_msg(peer, buf)
@@ -1508,23 +1685,28 @@ class Client(object):
             from ip {} {}'.format(ip, e.args))
 
         if msg_ident == HANDSHAKE_ID:
-            # no! handler peers are not mixed with other peers
-            self.active_peers.update({ip: peer})  # add open peer to active_peers
-            self.channel_state[ip] = ChannelState(open=1, state=1)
-            self.bt_state[ip] = BTState(choked=1, interested=0)
+            # process handshake msg
+            self.server_conn[ip] = peer
+            self.process_server_read(peer, msg)
         else:
             raise ProtocolError('handle_leecher: first msg must be Handshake')
 
-        # write handshake msg
-        self.writer.write(self.HANDSHAKE)
-        self.channel_state[ip].state = 2
-        print('handle_leecher: wrote Handshake to {}'.format(ip))
-
-        # write bitfield msg
+        # write handshake msg and bitfield msg
         msg = self.make_bitfield_msg()
-        self.writer.write(msg)
+        self.writer.write(self.HANDSHAKE + msg)
+        # process_server_write
         peer._client_keepalive_timer = datetime.datetime.utcnow()
+        print('handle_leecher: wrote Handshake to {}'.format(ip))
         print('handle_leecher: wrote Bitfield to {}'.format(ip))
+        logging.debug('handle_leecher: wrote Handshake and Bitfield to {}'.format(ip))
+
+        while True:
+            # read next msg
+            try:
+                yield from self.read_peer()
+            except Exception as e:
+                print(e.args)
+            pass
 
 
     @asyncio.coroutine
@@ -1533,7 +1715,7 @@ class Client(object):
         close a connection that has timed out
         timeout is CONNECTION_TIMEOUT secs
         """
-        if datetime.datetime.utcnow() - peer._timer > CONNECTION_TIMEOUT:
+        if datetime.datetime.utcnow() - peer.timer > CONNECTION_TIMEOUT:
             # close connection
             self._close_peer_connection(peer)
     
@@ -1541,9 +1723,8 @@ class Client(object):
     def send_keepalive(self, peer):
         """sends keep_alive to peer if timer was updated > CONNECTION_TIMEOUT secs ago"""
         if datetime.datetime.utcnow() - peer._client_keepalive_timer > CONNECTION_TIMEOUT:
-
             peer.writer.write(KEEPALIVE)
-            yield from writer.drain()
+            yield from peer.writer.drain()
 
             peer._client_keepalive_timer = datetime.datetime.utcnow()
             logging.debug('wrote KEEPALIVE to {}'.format(peer.address[0]))
@@ -1703,6 +1884,9 @@ class Client(object):
                 rindex not in self.pbuffer.completed_pieces:
                     if not self.pbuffer.is_registered(rindex):
                         try:
+                            self.pbuffer._register_piece(rindex)
+                        except BufferFullError as e:
+                            self.write_buffer_to_file()
                             self.pbuffer._register_piece(rindex)
                         except Exception as e:
                             print(e.args)
@@ -1948,12 +2132,18 @@ class Peer(object):
         self.has_pieces = set()  # set of piece indices
         self.reader = None
         self.writer = None
+
         # bt_state = choked by client, interested in client
         self.bt_state = BTState() # choked = 1, interested = 0
+        # for a peer that initiates connection to client
+        self.download_state = 0
+
         # peer keepalive timer (reset when client receives msg from peer)
-        self._timer = datetime.datetime.utcnow() 
+        self.timer = datetime.datetime.utcnow()
+         
         # client keepalive timer (reset when client sends msg to peer)
         self._client_keepalive_timer = datetime.datetime.utcnow()
+
         # statistics
         self.number_bytes_uploaded = 0     # client.process_read_msg (read request msg)
         self.number_bytes_downloaded = 0   # client.process_read_msg (read piece msg)
@@ -1967,31 +2157,107 @@ class Peer(object):
         return piece_index in self.has_pieces 
 
 
-@asyncio.coroutine
-def main(client):
-    port_index = 0
+#@asyncio.coroutine
+#def main(client):
+#    port_index = 0
+#    while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
+#        success = client.connect_to_tracker(PORTS[port_index])  # blocking
+#        port_index = (port_index + 1) % len(PORTS)  
+        
+#        if success:
+#            tasks_connect = [client.connect_to_peer(peer) \
+#                for peer in client.active_peers.values() if peer]
+#            tasks_keep_alive = [client.send_keepalive(peer) \
+#                for peer in client.active_peers.values() if peer]
+#            #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
+#            #    for peer in client.active_peers.values()]
+#            try:
+#                for task in tasks_connect+tasks_keep_alive:
+#                    yield from task
+#            except KeyboardInterrupt as e:
+#                print(e.args)
+#                #client.shutdown()
+#                raise e
+#            except Exception as e:
+#                print(e.args)
+#                #client.shutdown()
+#                raise e
+
+#            # finished connecting to each peer, now...let's get some pieces
+#            while client.open_peers() and not client.all_pieces() and client.piece_cnts:
+#                # at least 1 peer is open and 
+#                # not all pieces are complete and 
+#                # open peer(s) may have pieces that client needs
+                
+#                # each task gets blocks for a piece from a distinct peer
+#                result = client.select_piece() # stores [piece, set-of-peers] in attr
+#                if result == 'success':
+#                    index, peers = client.selected_piece_peers
+#                    for peer in peers:
+#                        yield from client.get_piece(index, peer)
+#                        yield from client.send_keepalive(peer)
+#                        #yield from server_coro # listens to joining peers
+#                else:
+#                    # no pieces in open peers
+#                    # connect to tracker
+#                    break
+#    # download complete
+#    print('all pieces downloaded')
+#    print('client is a seeeder')
+#    client.TRACKER_EVENT='completed'
+#    client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
+
+########## 
+if __name__ == "__main__":
+    torrent_obj = TorrentWrapper("Mozart_mininova.torrent")
+    #torrent_obj = TorrentWrapper("Conversations with Google [mininova].torrent")
+    #torrent_obj = TorrentWrapper("Trigger Hippy Gorman Herring Freed Govrik - Live in Macon GA [mininova].torrent")
+    #torrent_obj = TorrentWrapper("A Free educational book for teaching english and english teachers [mininova].torrent")
+    #torrent_obj = TorrentWrapper("Noah Cohn - Devils Tongue [mininova].torrent")
+
+    BUFFER_SIZE = torrent_obj.number_pieces + 1
+    #BUFFER_SIZE = 1
+    print('torrent is multi file: {}'.format(torrent_obj.is_multi_file()))
+
+    print('list of file boundaries: {}'.format(torrent_obj.list_of_file_boundaries()))
+
+    client = Client(torrent_obj)
+
+    loop = asyncio.get_event_loop()
+    loop.set_debug(enabled=True)
+    logging.captureWarnings(capture=True)
+
+    port_index = 0 # tracker port index
     while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
-        success = client.connect_to_tracker(PORTS[port_index])  # blocking
+        try:
+            #success = client.connect_to_tracker(PORTS[port_index])  # blocking  # mininova not working today 11/30
+            #client._parse_active_peers_for_testing('85.104.237.222', 33382) # 85.104.237.222:33382 95.9.70.61:19130
+            list_of_peers = [('95.9.70.61', 19130), ('82.222.140.251', 27875)]
+            client._parse_active_peers_for_testing(list_of_peers)
+            success = True
+        except KeyboardInterrupt as e:
+            raise e
+        except Exception as e:
+            # try another tracker port
+            print(e.args)
+            port_index = (port_index + 1) % len(PORTS)
+            success = False
+            
         port_index = (port_index + 1) % len(PORTS)  
         
         if success:
             tasks_connect = [client.connect_to_peer(peer) \
-                for peer in client.active_peers.values()]
+                for peer in client.active_peers.values() if peer] # a list of coros
             tasks_keep_alive = [client.send_keepalive(peer) \
-                for peer in client.active_peers.values()]
+                for peer in client.active_peers.values() if peer] # a list of coros
             #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
             #    for peer in client.active_peers.values()]
             try:
-                for task in tasks_connect+tasks_keep_alive:
-                    yield from task
+                loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive)) # convert coros to tasks
             except KeyboardInterrupt as e:
                 print(e.args)
-                client.shutdown()
-                raise e
             except Exception as e:
                 print(e.args)
-                client.shutdown()
-                raise e
 
             # finished connecting to each peer, now...let's get some pieces
             while client.open_peers() and not client.all_pieces() and client.piece_cnts:
@@ -2003,104 +2269,47 @@ def main(client):
                 result = client.select_piece() # stores [piece, set-of-peers] in attr
                 if result == 'success':
                     index, peers = client.selected_piece_peers
-                    for peer in peers:
-                        yield from client.get_piece(index, peer)
-                        yield from client.send_keepalive(peer)
-                        #yield from server_coro # listens to joining peers
+                    tasks_get_piece = [client.get_piece(index, peer) for peer in peers]
                 else:
                     # no pieces in open peers
                     # connect to tracker
                     break
+                try:
+                    loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
+                except KeyboardInterrupt as e:
+                    print(e.args)
+                    client.shutdown() # send tracker event='stopped'; flush buffer to file system
+                except Exception as e:
+                    print(e.args)
+                    
+
     # download complete
     print('all pieces downloaded')
     print('client is a seeeder')
     client.TRACKER_EVENT='completed'
-    client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
+    #client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)   mininova tracker isn't working today 11/30
+    # test writing file to buffer
+    client.shutdown()  # flush buffer to file
+    loop.close()
 
-########## 
-if __name__ == "__main__":
-    #torrent_obj = TorrentWrapper("Mozart_mininova.torrent")
-    #torrent_obj = TorrentWrapper("Conversations with Google [mininova].torrent")
-    torrent_obj = TorrentWrapper("Trigger Hippy Gorman Herring Freed Govrik - Live in Macon GA [mininova].torrent")
-    BUFFER_SIZE = torrent_obj.number_pieces + 1
-    assert torrent_obj.is_multi_file() == True
+    #server_coro = asyncio.start_server(client.handle_leecher, host='192.198.0.102', port=8000, loop=loop)
+    #server = loop.run_until_complete(server_coro)
 
-    # print(torrent_obj.list_of_file_boundaries())
+    #try:
+    #    loop.run_forever()
+    #except KeyboardInterrupt as e:
+    #    # shutdown server (connection listener)
+    #    server.close()
+    #    loop.run_until_complete(server.wait_closed())
+    #    # client shutdown
+    #    client.shutdown()  # tracker event='stopped'
+    #    loop.close()
+    #except OSError as e:
+    #    print(e.args)
+    #    # client shutdown
+    #    client.shutdown()  # # flush buffer to file
+    #    loop.close()
 
-    client = Client(torrent_obj)
-    port_index = 0  # tracker port
-
-    loop = asyncio.get_event_loop()
-    loop.set_debug(enabled=True)
-    logging.captureWarnings(capture=True)
-
-    server_coro = asyncio.start_server(client.handle_leecher, host='192.168.0.132', port=8000, loop=loop)
-    #server = loop.run_until_complete(coro)
-    #loop.run_until_complete(asyncio.async(main(client)))
-
-    
-
-    #while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
-    #    success = client.connect_to_tracker(PORTS[port_index])  # blocking
-    #    port_index = (port_index + 1) % len(PORTS)  
-        
-    #    if success:
-    #        tasks_connect = [client.connect_to_peer(peer) \
-    #            for peer in client.active_peers.values()]
-    #        tasks_keep_alive = [client.send_keepalive(peer) \
-    #            for peer in client.active_peers.values()]
-    #        #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
-    #        #    for peer in client.active_peers.values()]
-    #        try:
-    #            loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive))
-    #        except KeyboardInterrupt as e:
-    #            print(e.args)
-    #            client.shutdown()
-    #            raise e
-    #        except Exception as e:
-    #            print(e.args)
-    #            client.shutdown()
-    #            raise e
-
-    #        # finished connecting to each peer, now...let's get some pieces
-    #        while client.open_peers() and not client.all_pieces() and client.piece_cnts:
-    #            # at least 1 peer is open and 
-    #            # not all pieces are complete and 
-    #            # open peer(s) may have pieces that client needs
-                
-    #            # each task gets blocks for a piece from a distinct peer
-    #            result = client.select_piece() # stores [piece, set-of-peers] in attr
-    #            if result == 'success':
-    #                index, peers = client.selected_piece_peers
-    #                task_get_piece = [client.get_piece(index, peer) for peer in peers]
-    #                task_keep_alive = [client.send_keepalive(peer) for peer in peers]
-    #                loop.run_until_complete(asyncio.wait(task_get_piece+task_keep_alive))
-    #            else:
-    #                # no pieces in open peers
-    #                # connect to tracker
-    #                break
-    ## download complete
-    #print('all pieces downloaded')
-    #print('client is a seeeder')
-    #client.TRACKER_EVENT='completed'
-    #client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
-
-    #@asyncio.coroutine
-    #def run_client(client):
-    #    yield from main(client)
-        
-    
-
-    try:
-        loop.run_until_complete(asyncio.wait([main(client), server_coro])) # main ends when client downloads all pieces
-        # but server keeps running
-    except KeyboardInterrupt as e:
-        print(e.args)
-    except Exception as e:
-        print(e.args)
-    finally:
-        client.shutdown()
-        loop.close()
 
 
 
