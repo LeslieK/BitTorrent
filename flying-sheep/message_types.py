@@ -385,7 +385,7 @@ class TorrentWrapper(object):
 class Client(object):
     """client uploads/downloads 1 torrent (1 or more files)"""
 
-    def __init__(self, torrent):
+    def __init__(self, torrent, seeder=False):
         self.peer_id = my_peer_id()
         self.torrent = torrent
 
@@ -422,6 +422,7 @@ class Client(object):
         self.tracker_timer = datetime.datetime.utcnow()
         self.tracker_request_interval = datetime.timedelta(seconds=0)
         self.tracker_response = {}
+        self.TRACKER_ID = None
         self.TRACKER_EVENT = 'started'
 
         # used by _get_next_piece
@@ -431,6 +432,7 @@ class Client(object):
         # used by server (uploader)
         self.number_unchoked_peers = 0
         self.server_conn = {} # {ip: peer} # peers initiate connection to client
+        self.seeder = seeder
 
 
 
@@ -520,6 +522,8 @@ class Client(object):
         # blocking
         if self.TRACKER_EVENT:
             http_get_params['event'] = self.TRACKER_EVENT
+        if self.TRACKER_ID:
+            http_get_params['tracker id'] = self.TRACKER_ID
         try:
             r = requests.get(self.torrent.TRACKER_URL, params=http_get_params) # blocking
             self.TRACKER_EVENT = None
@@ -559,6 +563,8 @@ class Client(object):
             self.tracker_request_interval = \
                 datetime.timedelta(seconds=self.tracker_response.get('min interval', 
                                           self.tracker_response['interval']))
+            if 'tracker id' in self.tracker_response:
+                self.tracker_id = self.tracker_response['tracker id']
             return True
             
     def _parse_peers(self):
@@ -1294,7 +1300,8 @@ class Client(object):
                 self.channel_state[ip].state = 4
             elif self.channel_state[ip].state == 8:
                 self.channel_state[ip].state = 81
-            pass # peer chokes client
+            else:
+                pass   # peer chokes client
 
         elif ident == 1:
             #  unchoke message
@@ -1319,7 +1326,8 @@ class Client(object):
                 self.channel_state[ip].state = 6  
             elif self.channel_state[ip].state == 81:
                 self.channel_state[ip].state = 8
-            pass # peer unchokes client
+            else:
+                pass # peer unchokes client
         elif ident == 2:
             #  interested message
             length = self._4bytes_to_int(buf[0:4])
@@ -1334,6 +1342,7 @@ class Client(object):
             if self.number_unchoked_peers < MAX_UNCHOKED_PEERS:
                 self.send_unchoke_msg(peer)
                 self.number_unchoked_peers += 1
+                self.process_write_msg(peer, ident)
                 print('process_read_msg: sent unchoke msg to {} number unchoked peers {}'\
                     .format(ip, self.number_unchoked_peers))
                 logging.debug('process_read_msg: sent unchoke msg to {} number unchoked peers {}'\
@@ -1344,7 +1353,8 @@ class Client(object):
                 print('process_read_msg: number of unchoked peers is {}'\
                     .format(MAX_UNCHOKED_PEERS))
                 logging.debug('process_read_msg: number of unchoked peers is {}'\
-                    .format(MAX_UNCHOKED_PEERS))
+                    .format(MAX_UNCHOKED_PEERS)) # peer sends Interested msg
+                
         elif ident == 3:
             #  not interested message
             length = self._4bytes_to_int(buf[0:4])
@@ -1359,6 +1369,7 @@ class Client(object):
             if peer.bt_state.choked == 0: # unchoked
                 self.send_choke_msg(peer)
                 self.number_unchoked_peers -= 1
+                self.process_write_msg(peer, ident)
 
         elif ident == 4:
             #  have message
@@ -1404,9 +1415,9 @@ class Client(object):
                     yield from self.send_piece_msg(peer, msgd)
                 except Exception as e:
                     self._close_peer_connection(peer)
-                peer.number_bytes_downloaded += msgd['length']  # peer sends request message
+                peer.number_bytes_downloaded += msgd['length']  # client sends block
                 self.number_bytes_uploaded += msgd['length']
-                self.process_server_write(peer, msg)
+                self.process_write_msg(peer, ident)  # peer sends Request msg; client sends Piece msg
         elif ident == 7:
             #  piece message
             peer.timer = datetime.datetime.utcnow()
@@ -1417,23 +1428,24 @@ class Client(object):
                 print('process_read_msg: BufferFullError ip: {}'.format(ip))
                 raise e
             except Exception as e:
-                print(e.args)
+                print('process_read_msg: {}'.format(e.args))
+                logging.debug('process_read_msg: {}'.format(e.args))
                 raise e
 
             msgd = self._parse_piece_msg(buf)
             if self.channel_state[ip].state == 7:
                 if result == 'done':
                     self.channel_state[ip].state = 8
-                    peer.number_pieces_downloaded += 1
+                    peer.number_bytes_uploaded += msgd['length'] - 9  # peer -> client
                 elif result == 'not done' or result == 'bad hash':
                     self.channel_state[ip].state = 6
-                    peer.number_bytes_downloaded += msgd['length'] - 9 # length of block
+                    peer.number_bytes_uploaded += msgd['length'] - 9  # length of block
                 elif result == 'already have block':
-                    # piece msg is a duplicate: go to state 6 or stay in state 7?
+                    # piece msg is a duplicate: go to state 6
                     self.channel_state[ip].state = 6
                     print('process_read_msg: duplicate block')
                     logging.debug('process_read_msg: duplicate block')
-            pass # client reads block from peer
+            pass  # peer sends block to client
         elif ident == 8:
             #  cancel message
             peer.timer = datetime.datetime.utcnow()
@@ -1488,24 +1500,24 @@ class Client(object):
             elif self.channel_state[ip].state == 9:
                 self.channel_state[ip].state = 6 # 8
             elif self.channel_state[ip].state == 10: # added
-                self.channel_state[ip].state = 5
+                self.channel_state[ip].state = 5   # client writes Interested to peer
         elif ident == 3:
             # client writes Not Interested to peer
             self.bt_state[ip].interested = 0  # client not interested in peer
             if self.channel_state[ip].state == 8:
-                self.channel_state[ip].state = 9
+                self.channel_state[ip].state = 9 # client writes Not Interested
         elif ident == 4:
             # client writes Have to peer
-            pass
+            pass # client writes Have to peer
         elif ident == 6:
             # client writes Request to peer
             if self.channel_state[ip].state == 6:
                 self.channel_state[ip].state = 7
             elif self.channel_state[ip].state == 8:
-                self.channel_state[ip].state = 7
+                self.channel_state[ip].state = 7 # client writes Request for block
         elif ident == 7:
             # client writes Piece msg to peer
-            pass
+            pass # client writes Piece to peer
         elif ident == 8:
             # client writes Cancel to peer
             if self.channel_state[ip].state == 7:
@@ -1513,7 +1525,7 @@ class Client(object):
             elif self.channel_state[ip] in [8, 9, 10]:
                 pass
             elif self.channel_state[ip] < 7 or self.channel_state[ip] == 30:
-                raise ProtocolError("Cancel received in an invalid state {}".format(self.channel_state[ip].state))
+                raise ProtocolError("Cancel received in an invalid state {}".format(self.channel_state[ip].state)) # client writes Cancel to peer
         else:
             print("Client wrote Unknown message ident: {}".format(ident))
             raise ProtocolError("Client wrote Unknown message ident: {}".format(ident))
@@ -1614,8 +1626,6 @@ class Client(object):
         """
         runs state machine on incoming connections
 
-
-
         """
         ip, _ = peer.address
         buf = bytearray(msg)
@@ -1707,7 +1717,6 @@ class Client(object):
             except Exception as e:
                 print(e.args)
             pass
-
 
     @asyncio.coroutine
     def close_quiet_connections(self, peer):
@@ -2145,9 +2154,8 @@ class Peer(object):
         self._client_keepalive_timer = datetime.datetime.utcnow()
 
         # statistics
-        self.number_bytes_uploaded = 0     # client.process_read_msg (read request msg)
-        self.number_bytes_downloaded = 0   # client.process_read_msg (read piece msg)
-        self.number_pieces_downloaded = 0  # hash-verified pieces; client.process_read_msg (read piece msg)
+        self.number_bytes_uploaded = 0     # client.process_read_msg (client reads piece msg)
+        self.number_bytes_downloaded = 0   # client.process_read_msg (client sends piece msg)
         
     def has_piece(self, piece_index):
         """
@@ -2165,99 +2173,97 @@ if __name__ == "__main__":
     #torrent_obj = TorrentWrapper("Noah Cohn - Devils Tongue [mininova].torrent")
 
     BUFFER_SIZE = torrent_obj.number_pieces + 1
-    #BUFFER_SIZE = 1
     print('torrent is multi file: {}'.format(torrent_obj.is_multi_file()))
-
-    print('list of file boundaries: {}'.format(torrent_obj.list_of_file_boundaries()))
-
-    client = Client(torrent_obj)
 
     loop = asyncio.get_event_loop()
     loop.set_debug(enabled=True)
     logging.captureWarnings(capture=True)
 
-    port_index = 0 # tracker port index
-    while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
-        try:
-            #success = client.connect_to_tracker(PORTS[port_index])  # blocking  # mininova not working today 11/30
-            #client._parse_active_peers_for_testing('85.104.237.222', 33382) # 85.104.237.222:33382 95.9.70.61:19130
-            list_of_peers = [('95.9.70.61', 19130), ('82.222.140.251', 27875)]
-            client._parse_active_peers_for_testing(list_of_peers)
-            success = True
-        except KeyboardInterrupt as e:
-            raise e
-        except Exception as e:
-            # try another tracker port
-            print(e.args)
-            port_index = (port_index + 1) % len(PORTS)
-            success = False
-            
-        port_index = (port_index + 1) % len(PORTS)  
-        
-        if success:
-            tasks_connect = [client.connect_to_peer(peer) \
-                for peer in client.active_peers.values() if peer] # a list of coros
-            tasks_keep_alive = [client.send_keepalive(peer) \
-                for peer in client.active_peers.values() if peer] # a list of coros
-            #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
-            #    for peer in client.active_peers.values()]
-            try:
-                loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive)) # convert coros to tasks
-            except KeyboardInterrupt as e:
-                print(e.args)
-            except Exception as e:
-                print(e.args)
+    client = Client(torrent_obj, seeder=False)
 
-            # finished connecting to each peer, now...let's get some pieces
-            while client.open_peers() and not client.all_pieces() and client.piece_cnts:
-                # at least 1 peer is open and 
-                # not all pieces are complete and 
-                # open peer(s) may have pieces that client needs
-                
-                # each task gets blocks for a piece from a distinct peer
-                result = client.select_piece() # stores [piece, set-of-peers] in attr
-                if result == 'success':
-                    index, peers = client.selected_piece_peers
-                    tasks_get_piece = [client.get_piece(index, peer) for peer in peers]
-                else:
-                    # no pieces in open peers
-                    # connect to tracker
-                    break
+    if not client.seeder:
+        port_index = 0 # tracker port index
+        while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
+            try:
+                success = client.connect_to_tracker(PORTS[port_index])  # blocking  # mininova not working today 11/30
+                #client._parse_active_peers_for_testing('85.104.237.222', 33382) # 85.104.237.222:33382 95.9.70.61:19130
+                #list_of_peers = [('95.9.70.61', 19130), ('82.222.140.251', 27875), ('78.184.67.162', 56681)] # test code
+                #client._parse_active_peers_for_testing(list_of_peers) # test code
+            except KeyboardInterrupt as e:
+                raise e
+            except Exception as e:
+                # try another tracker port
+                print(e.args)
+                port_index = (port_index + 1) % len(PORTS)
+                success = False
+            
+            port_index = (port_index + 1) % len(PORTS)  
+        
+            if success:
+                tasks_connect = [client.connect_to_peer(peer) \
+                    for peer in client.active_peers.values() if peer] # a list of coros
+                tasks_keep_alive = [client.send_keepalive(peer) \
+                    for peer in client.active_peers.values() if peer] # a list of coros
+                #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
+                #    for peer in client.active_peers.values()]
                 try:
-                    loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
+                    loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive)) # convert coros to tasks
                 except KeyboardInterrupt as e:
                     print(e.args)
-                    client.shutdown() # send tracker event='stopped'; flush buffer to file system
                 except Exception as e:
                     print(e.args)
+
+                # finished connecting to each peer, now...let's get some pieces
+                while client.open_peers() and not client.all_pieces() and client.piece_cnts:
+                    # at least 1 peer is open and 
+                    # not all pieces are complete and 
+                    # open peer(s) may have pieces that client needs
+                
+                    # each task gets blocks for a piece from a distinct peer
+                    result = client.select_piece() # stores [piece, set-of-peers] in attr
+                    if result == 'success':
+                        index, peers = client.selected_piece_peers
+                        tasks_get_piece = [client.get_piece(index, peer) for peer in peers]
+                    else:
+                        # no pieces in open peers
+                        # connect to tracker
+                        break
+                    try:
+                        loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
+                    except KeyboardInterrupt as e:
+                        print(e.args)
+                        client.shutdown() # send tracker event='stopped'; flush buffer to file system
+                    except Exception as e:
+                        print(e.args)
                     
+        # download complete
+        print('all pieces downloaded')
+        logging.debug('all pieces downloaded')
+        print('client is a seeder')
+        logging.debug('client is a seeder')
+        client.seeder = True
+        client.TRACKER_EVENT='completed'
+        client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
 
-    # download complete
-    print('all pieces downloaded')
-    print('client is a seeeder')
-    client.TRACKER_EVENT='completed'
-    #client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)   mininova tracker isn't working today 11/30
-    # test writing file to buffer
-    client.shutdown()  # flush buffer to file
-    loop.close()
+    if client.seeder:
+        # if buffer is empty, read files from file system into buffer
+        # ...
 
-    #server_coro = asyncio.start_server(client.handle_leecher, host='192.198.0.102', port=8000, loop=loop)
-    #server = loop.run_until_complete(server_coro)
+        # not sure what host= and port= should be.
+        server_coro = asyncio.start_server(client.handle_leecher, host='192.198.0.102', port=8000, loop=loop)
+        server = loop.run_until_complete(server_coro)
 
-    #try:
-    #    loop.run_forever()
-    #except KeyboardInterrupt as e:
-    #    # shutdown server (connection listener)
-    #    server.close()
-    #    loop.run_until_complete(server.wait_closed())
-    #    # client shutdown
-    #    client.shutdown()  # tracker event='stopped'
-    #    loop.close()
-    #except OSError as e:
-    #    print(e.args)
-    #    # client shutdown
-    #    client.shutdown()  # # flush buffer to file
-    #    loop.close()
+        try:
+            loop.run_forever()
+        except (KeyboardInterrupt, OSError) as e:
+            # shutdown server (connection listener)
+            print(e.args)
+            logging.debug(e.args)
+        finally:
+            server.close()
+            loop.run_until_complete(server.wait_closed())
+            client.shutdown()  # tracker event='stopped' # flush buffer to file system
+            loop.close()
 
 
 
