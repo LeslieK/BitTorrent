@@ -2156,57 +2156,6 @@ class Peer(object):
         """
         return piece_index in self.has_pieces 
 
-
-#@asyncio.coroutine
-#def main(client):
-#    port_index = 0
-#    while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
-#        success = client.connect_to_tracker(PORTS[port_index])  # blocking
-#        port_index = (port_index + 1) % len(PORTS)  
-        
-#        if success:
-#            tasks_connect = [client.connect_to_peer(peer) \
-#                for peer in client.active_peers.values() if peer]
-#            tasks_keep_alive = [client.send_keepalive(peer) \
-#                for peer in client.active_peers.values() if peer]
-#            #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
-#            #    for peer in client.active_peers.values()]
-#            try:
-#                for task in tasks_connect+tasks_keep_alive:
-#                    yield from task
-#            except KeyboardInterrupt as e:
-#                print(e.args)
-#                #client.shutdown()
-#                raise e
-#            except Exception as e:
-#                print(e.args)
-#                #client.shutdown()
-#                raise e
-
-#            # finished connecting to each peer, now...let's get some pieces
-#            while client.open_peers() and not client.all_pieces() and client.piece_cnts:
-#                # at least 1 peer is open and 
-#                # not all pieces are complete and 
-#                # open peer(s) may have pieces that client needs
-                
-#                # each task gets blocks for a piece from a distinct peer
-#                result = client.select_piece() # stores [piece, set-of-peers] in attr
-#                if result == 'success':
-#                    index, peers = client.selected_piece_peers
-#                    for peer in peers:
-#                        yield from client.get_piece(index, peer)
-#                        yield from client.send_keepalive(peer)
-#                        #yield from server_coro # listens to joining peers
-#                else:
-#                    # no pieces in open peers
-#                    # connect to tracker
-#                    break
-#    # download complete
-#    print('all pieces downloaded')
-#    print('client is a seeeder')
-#    client.TRACKER_EVENT='completed'
-#    client.connect_to_tracker(PORTS[port_index], numwant=0, completed=True)
-
 ########## 
 if __name__ == "__main__":
     torrent_obj = TorrentWrapper("Mozart_mininova.torrent")
