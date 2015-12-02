@@ -3,12 +3,73 @@ This module provides utility functions for a bit torrent client.
 """
 import os
 import math
+import datetime
 import hashlib
 import socket
 from bcoding import bdecode, bencode
 
+ROOT_DIR = 'c:\\Users\\lbklein\\PROJECTS\\VisualStudio2015Projects\\AsynchIO\\flying-sheep'
+
 HASH_DIGEST_SIZE = 20  # in bytes
 PEER_ID_SIZE = 20 # in bytes
+
+DEFAULT_BLOCK_LENGTH = 2**14
+BLOCK_SIZE = DEFAULT_BLOCK_LENGTH
+MAX_BLOCK_SIZE = bytes([4, 0, 0, 0]) # 2**14 == 16384
+MAX_PEERS = 50
+MAX_PEERS_TO_REQUEST_FROM = 1  # used in client._get_next_piece()
+MAX_UNCHOKED_PEERS = 5
+
+NUMWANT = 10  # GET parameter to tracker
+CONNECTION_TIMEOUT = datetime.timedelta(seconds=90)
+HANDSHAKE_ID = 100
+KEEPALIVE_ID = 200
+NOTSUPPORTED_ID = 300
+
+PORTS = [i for i in range(6881, 6890)]
+HANDSHAKE_ID = 100
+KEEPALIVE_ID = 200
+NOTSUPPORTED_ID = 300
+
+bt_messages = {0: 'Choke',
+               1: 'Unchoke',
+               2: 'Interested',
+               3: 'Not Interested',
+               4: 'Have',
+               5: 'Bitfield',
+               6: 'Request',
+               7: 'Piece',
+               8: 'Cancel',
+               9: 'Port',
+               20: 'Extended',
+               HANDSHAKE_ID: 'Handshake',
+               KEEPALIVE_ID: 'KeepAlive',
+               NOTSUPPORTED_ID: 'Not Supported'}
+
+bt_messages_by_name = {name: ident for ident, name in bt_messages.items()}
+
+class BTState:
+    def __init__(self, choked=1, interested=0):
+        self.choked = choked
+        self.interested = interested
+
+class ChannelState:
+    def __init__(self, open=0, state=0):
+        self.open = open
+        self.state = state
+
+class ConnectionError(Exception):
+    pass
+
+class ConnectionResetError(Exception):
+    pass
+
+class BufferFullError(Exception):
+    pass
+
+
+class ProtocolError(Exception):
+    pass
 
 def sha1_info(torrent):
     """returns sha1 hash of torrent['info']"""
@@ -52,68 +113,6 @@ def rcv_handshake(buf):
         msgd['info_hash'] = buf[pstrlen+9:pstrlen+29]
         msgd['peer_id'] = buf[pstrlen+29:pstrlen+49]
     return msgd
-
-
-
-#def announce(torrent):
-#    """
-#    torrent: the dict in the .torrent file
-#    returns announce url: url of tracker
-#    """
-#    return torrent['announce']
-
-
-#def get_hash(torrent, index, digest_size=HASH_DIGEST_SIZE):
-#    # hashes = io.BytesIO(torrent['info']['pieces']).getbuffer().tobytes()
-#    hashes = torrent['info']['pieces']
-#    hash_index = index * digest_size
-#    return hashes[hash_index:hash_index + digest_size]
-
-#def num_pieces(torrent, digest_size=HASH_DIGEST_SIZE):
-#    return math.ceil(total_file_length(torrent) / torrent['info']['piece length'])
-
-#def total_file_length(torrent):
-#    return sum([file['length'] for file in file_info(torrent)])
-
-#def is_multi_file(torrent):
-#    return 'files' in torrent['info']
-
-#def file_info(torrent):
-#    """
-#    if multi-file:
-#    returns [{'length': len1, 'name': dir1/dir2/fileA]}, {'length': len2, 'name': 'fileB'}, ... ]
-#    if single-file:
-#    return [{'length': nn, 'name': filename}]
-#    """
-#    if is_multi_file(torrent):
-#        dict = {}
-#        files = torrent['info']['files']
-#        file_info = [{'length': file['length'], 'name': os.path.join(*file['path'])} for file in files]      
-#    else:
-#        name = torrent['info']['name']
-#        file_size = torrent['info']['length']
-#        file_info = [{'length': torrent['info']['length'], 'name': torrent['info']['name']}]
-#    return file_info
-
-
-
-
-## process Tracker Responses
-#def tracker_response(r):
-#    """
-#    input: Tracker Get Response
-#    output: bdecoded response
-#    """
-#    return bdecode(r.content)
-
-#def list_of_peers(peers):
-#    """
-#    input: byte string of peer addresses (6 bytes per address); tracker_response['peers']
-#    output: list of peer dicts [{'ip': <ipv4 addr>, 'port': <port num>}, ... ]
-#    """
-#    return [{'ip': socket.inet_ntoa(peers[index*4:(index + 1)*4]), 'port': port_bytes[0]*256 + port_bytes[1]} 
-#            for index in range(len(peers)//6) 
-#            for port_bytes in [peers[(index + 1)*4:(index + 1)*4 + 2]]]        
 
 
 

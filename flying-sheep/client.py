@@ -1,16 +1,20 @@
-﻿"""
-This module implements a BitTorrent client without extensions.
+"""
+Leslie B. Klein
+Dec. 1, 2015
+
+This module is a BitTorrent client without extensions.
+It uploads pieces while it downloads pieces.
+Once it becomes a seeder, it runs a server and uploads pieces.
+
+It uses python 3.4.3 with the asyncio library to achieve concurrency.
 """
 from bcoding import bdecode, bencode
 from collections import defaultdict, Counter
+
 import math
-import random
-import hashlib
-import array
 import bisect
 import datetime
-import sys, os, socket
-#import aiohttp
+import os, socket
 import requests
 import asyncio
 
@@ -21,27 +25,28 @@ from bt_utils import HASH_DIGEST_SIZE
 from bt_utils import ConnectionError, BufferFullError, ProtocolError, ConnectionResetError
 from bt_utils import bt_messages, bt_messages_by_name
 
+from bt_utils import DEFAULT_BLOCK_LENGTH
+from bt_utils import MAX_PEERS
+from bt_utils import BLOCK_SIZE
+from bt_utils import MAX_BLOCK_SIZE
+from bt_utils import MAX_PEERS_TO_REQUEST_FROM  # used in client._get_next_piece()
+from bt_utils import MAX_UNCHOKED_PEERS
+
+from bt_utils import PORTS
+from bt_utils import NUMWANT
+from bt_utils import CONNECTION_TIMEOUT
+from bt_utils import HANDSHAKE_ID
+from bt_utils import KEEPALIVE_ID
+from bt_utils import NOTSUPPORTED_ID
+from bt_utils import ROOT_DIR
+
+from piece_buffer import PieceBuffer
+
 import logging
+
 logger = logging.getLogger('asyncio')
 logging.basicConfig(filename="bittorrent.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
 logging.captureWarnings(capture=True)
-
-ROOT_DIR = 'c:\\Users\\lbklein\\PROJECTS\\VisualStudio2015Projects\\AsynchIO\\flying-sheep'
-
-DEFAULT_BLOCK_LENGTH = 2**14
-BLOCK_SIZE = DEFAULT_BLOCK_LENGTH
-MAX_BLOCK_SIZE = bytes([4, 0, 0, 0]) # 2**14 == 16384
-MAX_PEERS = 50
-MAX_PEERS_TO_REQUEST_FROM = 1  # used in client._get_next_piece()
-MAX_UNCHOKED_PEERS = 5
-
-NUMWANT = 10  # GET parameter to tracker
-CONNECTION_TIMEOUT = datetime.timedelta(seconds=90)
-HANDSHAKE_ID = 100
-KEEPALIVE_ID = 200
-NOTSUPPORTED_ID = 300
-
-PORTS = [i for i in range(6881, 6890)]
 
 KEEPALIVE = bytes([0, 0, 0, 0])
 CHOKE = bytes([0, 0, 0, 1]) + bytes([0])
@@ -49,298 +54,36 @@ UNCHOKE = bytes([0, 0, 0, 1]) + bytes([1])
 INTERESTED = bytes([0, 0, 0, 1]) + bytes([2])
 NOT_INTERESTED = bytes([0, 0, 0, 1]) + bytes([3])
 
-class PieceBuffer(object):
-    """
-    stores the bytes in a piece
-    stores up to BUFFER_SIZE pieces
-    """
-    def __init__(self, torrent):
+class Peer(object):
+    def __init__(self, torrent, address):
         self.torrent = torrent
-        self.buffer = {row: array.array('B', \
-            bytearray(self.torrent.torrent['info']['piece length'])) \
-            for row in range(BUFFER_SIZE)}
-        self.free_rows = {i for i in range(BUFFER_SIZE)}
-        self.completed_pieces = set()  # set of completed pieces (indices); store as a client attribute?
-        # {'piece index': 20, 'all_bytes_received': False, 'hash_verifies': False, 'bitfield': 1111100000, 'offset': 0x8000}
-        self.piece_info = {}
+        self.address = address # (ipv4, port)
+        self.peer_id = None
+        self.has_pieces = set()  # set of piece indices
+        self.reader = None
+        self.writer = None
+
+        # bt_state = choked by client, interested in client
+        self.bt_state = BTState() # choked = 1, interested = 0
+        # for a peer that initiates connection to client
+        self.download_state = 0
+
+        # peer keepalive timer (reset when client receives msg from peer)
+        self.timer = datetime.datetime.utcnow()
+         
+        # client keepalive timer (reset when client sends msg to peer)
+        self._client_keepalive_timer = datetime.datetime.utcnow()
+
+        # statistics
+        self.number_bytes_uploaded = 0     # client.process_read_msg (client reads piece msg)
+        self.number_bytes_downloaded = 0   # client.process_read_msg (client sends piece msg)
         
-    def is_full(self):
-        return not self.free_rows
-    
-    def is_registered(self, piece_index):
-        return piece_index in self.piece_info  
-
-    def insert_bytes(self, piece_index, begin, block):
+    def has_piece(self, piece_index):
         """
-        inserts bytes into the array for piece_index
-
-        piece_index: int
-        begin: int
-        block: sequence of bytes (bytearray)
+        True if peer has piece
+        False otherwise
         """
-
-        row = self.piece_info[piece_index]['row']
-        
-        # insert block of bytes
-        ablock = array.array('B', block)
-        self.buffer[row][begin:begin+len(ablock)] = ablock
-
-        logging.debug('insert_bytes: length(ablock) = {}, {}'.format(len(ablock), ablock[:5]))
-        print('insert_bytes: length(block) = {}, {}'.format(len(ablock), ablock[:5]))
-
-        logging.debug('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
-            .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
-        print('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
-            .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
-
-        # update bitfield (each bit represents a block in the piece)
-        #self._update_bitfield(piece_index)
-        self._update_bitfield(piece_index, begin)
-
-        # check if all blocks received
-        if self._is_all_blocks_received(piece_index):
-            
-            if self._is_piece_hash_good(piece_index):
-                # all bytes received
-                self.piece_info[piece_index]['all_blocks_received'] = True
-                # piece hash matches torrent hash
-                print('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
-                logging.debug('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
-                self.piece_info[piece_index]['hash_verifies'] = True
-                self.completed_pieces.add(piece_index)  # set of piece indices
-                return 'done'
-            else:
-                # piece hash does not match torrent match
-                return 'bad hash'
-        else:
-            # not all blocks received
-            return 'not done'
-
-    def reset(self, piece_index, free_row=False):
-        """
-        reset buffer row to bytearray()
-        reset bitfield to all 0s
-        if free_row == False: 
-            reset row but keep row in buffer
-        if free_row == True: 
-            add row to set of available rows
-            row data is no longer in buffer
-        """     
-        row = self.piece_info[piece_index]['row']
-
-        self.buffer[row] = array.array('B', bytearray(self.torrent.piece_length))
-        self.piece_info[piece_index]['bitfield'] = self._init_bitfield(piece_index)
-        self.piece_info[piece_index]['offset'] = 0
-        
-        if free_row:
-            del self.piece_info[piece_index]
-            self.free_rows.add(row)  # add row to set of available rows
-
-    def pieces_in_buffer(self):
-        """returns an iterator object that iterates over pieces in buffer"""
-        piece_indices = list(self.piece_info.keys())
-        return iter(piece_indices)
-
-    def is_piece_complete(self, piece_index):
-        """
-        self.completed_pieces: set of all completed pieces
-        """
-        return piece_index in self.completed_pieces
-
-
-    def _register_piece(self, piece_index):
-        try:
-            row = self.free_rows.pop()
-        except KeyError as e:
-            logging.debug("Buffer is full")
-            print("Buffer is full")
-            raise BufferFullError("Buffer is full")
-        else:
-            self.piece_info[piece_index] = {'row': row,
-                                    'all_blocks_received': False,
-                                    'hash_verifies': False,
-                                    'bitfield': self._init_bitfield(piece_index),
-                                    'offset': 0
-                                    }
-            #logging.debug('_register_piece: self.free_rows: {} index {}'.format(self.free_rows, piece_index))
-            #print('_register_piece: self.free_rows: {} index {}'.format(self.free_rows, piece_index))
-
-    def _sha1_hash(self, piece_index):
-        """hash the piece bytes"""
-        sha1 = hashlib.sha1()
-        try:
-            row = self.piece_info[piece_index]['row']
-        except KeyError:
-            print("piece index {} is not in buffer".format(piece_index))
-            logging.debug("piece index {} is not in buffer".format(piece_index))
-            raise KeyError
-
-        if piece_index != self.torrent.LAST_PIECE_INDEX:
-            piece = self.buffer[row]
-        else:
-            piece = self.buffer[row][:self.torrent.last_piece_length]
-
-        print('_sha1_hash: piece_index: {} bytes: {} {}'\
-            .format(piece_index, piece[:10], piece[:-5:-1]))
-        logging.debug('_sha1_hash: piece_index: {} bytes: {} {}'\
-            .format(piece_index, piece[:10], piece[:-5:-1]))
-        sha1.update(piece)
-        return sha1.digest()
-
-    def _is_piece_hash_good(self, piece_index):
-        torrent_hash_value = self.torrent.get_hash(piece_index)
-        piece_hash_value = self._sha1_hash(piece_index)
-        print(torrent_hash_value[:10])
-        print(piece_hash_value[:10])
-        return torrent_hash_value == piece_hash_value
-       
-    def _is_all_blocks_received(self, piece_index):
-        """
-        returns True if bitfield has no "0"
-        """
-        bf = bin(self.piece_info[piece_index]['bitfield'])[3:]
-        print('_is_all_blocks_received: blocks bitfield: {}'.format(bf))
-        logging.debug('_is_all_blocks_received: blocks bitfield: {}'.format(bf))
-        return not('0' in bf)
-
-    def _init_bitfield(self, piece_index):
-        """
-        init bitfield for a buffer row 
-        all bits initialized to 0
-        rightmost bit (LSB): block 0
-        """
-        try:
-            if piece_index != self.torrent.LAST_PIECE_INDEX:
-                number_of_blocks = math.ceil(self.torrent.piece_length / BLOCK_SIZE) 
-            else:
-                number_of_blocks = math.ceil(self.torrent.last_piece_length / BLOCK_SIZE)
-        except Exception as e:
-            print('pbuffer._init_bitfield: {}'.format(e.args))
-            logging.debug('pbuffer._init_bitfield: {}'.format(e.args))
-            raise e 
-             
-        field = 1 << number_of_blocks
-        return field
-    
-    def _update_bitfield(self, piece_index, offset):
-        """
-        update bitfield for buffer row
-        each bit represents a block
-        rightmost bit (LSB): block 0
-        """
-       
-        block_number = offset // BLOCK_SIZE
-
-        bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
-        length = len(bfs)
-        logging.debug('_update_bitfield (pbuffer): {} block number: {}'\
-            .format(bfs[length-1-block_number], block_number))
-        print('_update_bitfield (pbuffer): {} block number: {}'\
-            .format(bfs[length-1-block_number], block_number))
-
-        self.piece_info[piece_index]['bitfield'] |= 1 << block_number
-
-        bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
-        length = len(bfs)
-        logging.debug('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
-        print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
-
-class TorrentWrapper(object):
-    """
-    for a multi-file torrent, the piece indices are in the order of the files in the 'files' element.
-    For ex, if 1st file in the 'files' list has 6 pieces and the 2nd file in the 'files' list has 5 pieces, 
-    the first 6 of the 11 pieces are for file 1. The next 5 pieces are for file 2.
-    """
-    def __init__(self, metafile):
-        with open(metafile, 'rb') as f:
-            self.torrent = bdecode(f)
-
-        self.INFO_HASH = sha1_info(self.torrent)
-        self.TRACKER_URL = self.announce()
-        self.piece_length = self.torrent['info']['piece length']
-        self.total_bytes = self.total_file_length()
-        
-        self.number_pieces = self._num_pieces()
-        self.last_piece_length = self._length_of_last_piece()
-        self.LAST_PIECE_INDEX = self.number_pieces - 1
-
-        self.file_meta = self.file_info()
-        self.file_boundaries_by_byte_indices = self.list_of_file_boundaries()
-
-    def announce(self):
-        """
-        torrent: the dict in the .torrent file
-        returns announce url: url of tracker
-        """
-        return self.torrent['announce']
-
-
-    def get_hash(self, index, digest_size=HASH_DIGEST_SIZE):
-        # hashes = io.BytesIO(torrent['info']['pieces']).getbuffer().tobytes()
-        hashes = self.torrent['info']['pieces']
-        hash_index = index * digest_size
-        return hashes[hash_index:hash_index + digest_size]
-
-    def _num_pieces(self, digest_size=HASH_DIGEST_SIZE):
-        return math.ceil(self.total_bytes / self.piece_length)
-
-    def _length_of_last_piece(self):
-        return self.total_bytes - self.piece_length * (self.number_pieces - 1)
-
-    def total_file_length(self):
-        """returns the number of bytes across all files"""
-        if self.is_multi_file():
-            return sum([file['length'] for file in self.torrent['info']['files']])
-        else:
-            # single file
-            return self.torrent['info']['length']
-
-    def is_multi_file(self):
-        """return True if more than 1 file"""
-        return 'files' in self.torrent['info']
-
-    def file_info(self):
-        """
-        if multi-file:
-        returns [{'length': len1, 'name': dir1/dir2/fileA]}, {'length': len2, 'name': 'fileB'}, ... ]
-        if single-file:
-        return [{'length': nn, 'name': filename, 'num_pieces': <number pieces in this file>}]
-        """
-        piece_length = self.torrent['info']['piece length']
-        if self.is_multi_file():
-            dict = {}
-            files = self.torrent['info']['files']
-            file_meta = [{'length': file['length'],
-                          'name': os.path.join(*file['path']),
-                          'num_pieces': # beginning and/or ending piece might span adjacent files
-                          math.ceil(file['length'] / piece_length)}
-                          for file in files]      
-        else:
-            name = self.torrent['info']['name']
-            file_size = self.torrent['info']['length']
-            file_meta = [{'length': self.torrent['info']['length'],
-                          'name': self.torrent['info']['name'],
-                          'num_pieces': 
-                          math.ceil(self.torrent['info']['length']/piece_length)}]
-        return file_meta
-        
-
-    def list_of_file_boundaries(self):
-        """creates a list of file boundaries;
-        boudaries are byte indices
-        
-        ex: [len(file0), len(file0) + len(file1)]
-        file0: 0 <= byte indices < len(file0)
-        file1: len(file0) <= byte indices < len(file0) + len(file1)
-        res: [100, 100+51, 100+51+205]
-        """
-        res = []
-        list_of_file_lengths = [file['length'] for file in self.file_meta]
-        partial_sum = 0
-        for i in range(len(list_of_file_lengths)):
-            partial_sum += list_of_file_lengths[i]
-            res.append(partial_sum)
-        return res[:]
+        return piece_index in self.has_pieces 
 
 class Client(object):
     """client uploads/downloads 1 torrent (1 or more files)"""
@@ -417,6 +160,7 @@ class Client(object):
         # close all open files
         self._close_fds()
         print('closed all open files...')
+        logging.debug('closed all open files...')
 
         # shutdown client
         print('client is shutting down...')
@@ -486,7 +230,6 @@ class Client(object):
             http_get_params['tracker id'] = self.TRACKER_ID
         try:
             r = requests.get(self.torrent.TRACKER_URL, params=http_get_params) # blocking
-            self.TRACKER_EVENT = None
         except Exception as e:
             print(e.args)
             raise ConnectionError
@@ -494,7 +237,8 @@ class Client(object):
         # reset client's tracker timer
         self.tracker_timer = datetime.datetime.utcnow()
 
-        if self.TRACKER_EVENT in ['started', None]:
+        if not self.TRACKER_EVENT or self.TRACKER_EVENT == 'started':
+            # don't parse if event is 'completed' or 'stopped'
             tracker_resp = r.content
             try:
                 self.tracker_response = bdecode(tracker_resp)
@@ -503,6 +247,7 @@ class Client(object):
             success = self._parse_tracker_response()
             logging.debug('{}: parsed tracker response'.format(success))
             print('{}: parsed tracker response'.format(success))
+            self.TRACKER_EVENT = None
             return success
 
     def _parse_tracker_response(self):
@@ -835,7 +580,7 @@ class Client(object):
             else:
                 list_of_indices = most_common[-1:-num_peers-1:-1]
 
-            # get all ips with rarest piece
+            # get all peers (ips) with rarest piece
             index, cnt = list_of_indices[-1]
             ips_with_least = list(set(self.channel_state.keys()).intersection(self.piece_to_peers[index]))
             if ips_with_least:
@@ -991,6 +736,23 @@ class Client(object):
         row = self.pbuffer.piece_info[index]['row']
         block = self.pbuffer.buffer[row][offset:length_of_block].tobytes()
         return block
+
+    def send_not_interested_to_all(self):
+        """
+        client sends Not Interested to all open peers
+        after download completes
+        """
+        for ip, peer in self.open_peers().items():
+            if self.bt_state[ip].interested:
+                self.bt_state[ip].interested = 0
+                try:
+                    peer.writer.write(NOT_INTERESTED)
+                except Exception as e:
+                    print('send_not_interested_to_all: {} {}'.format(ip, e.args))
+                    logging.debug('send_not_interested_to_all: {} {}'.format(ip, e.args))
+                    pass
+
+
 
     @asyncio.coroutine
     def send_piece_msg(self, peer, msgd):
@@ -2091,142 +1853,4 @@ class Client(object):
                     channel state: {}"\
                         .format(msg_ident, self.channel_state[ip].state))
                     msg_ident = NOTSUPPORTED_ID    
-            return msg_ident    
-
-class Peer(object):
-    def __init__(self, torrent, address):
-        self.torrent = torrent
-        self.address = address # (ipv4, port)
-        self.peer_id = None
-        self.has_pieces = set()  # set of piece indices
-        self.reader = None
-        self.writer = None
-
-        # bt_state = choked by client, interested in client
-        self.bt_state = BTState() # choked = 1, interested = 0
-        # for a peer that initiates connection to client
-        self.download_state = 0
-
-        # peer keepalive timer (reset when client receives msg from peer)
-        self.timer = datetime.datetime.utcnow()
-         
-        # client keepalive timer (reset when client sends msg to peer)
-        self._client_keepalive_timer = datetime.datetime.utcnow()
-
-        # statistics
-        self.number_bytes_uploaded = 0     # client.process_read_msg (client reads piece msg)
-        self.number_bytes_downloaded = 0   # client.process_read_msg (client sends piece msg)
-        
-    def has_piece(self, piece_index):
-        """
-        True if peer has piece
-        False otherwise
-        """
-        return piece_index in self.has_pieces 
-
-########## 
-if __name__ == "__main__":
-    torrent_obj = TorrentWrapper("Mozart_mininova.torrent")
-    #torrent_obj = TorrentWrapper("Conversations with Google [mininova].torrent")
-    #torrent_obj = TorrentWrapper("Trigger Hippy Gorman Herring Freed Govrik - Live in Macon GA [mininova].torrent")
-    #torrent_obj = TorrentWrapper("A Free educational book for teaching english and english teachers [mininova].torrent")
-    #torrent_obj = TorrentWrapper("Noah Cohn - Devils Tongue [mininova].torrent")
-
-    BUFFER_SIZE = torrent_obj.number_pieces + 1
-
-    loop = asyncio.get_event_loop()
-    loop.set_debug(enabled=True)
-    logging.captureWarnings(capture=True)
-
-    client = Client(torrent_obj, seeder=False)
-
-    if not client.seeder:
-        port_index = 0 # tracker port index
-        while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
-            try:
-                success = client.connect_to_tracker(PORTS[port_index], numwant=NUMWANT)  # blocking
-                #client._parse_active_peers_for_testing('85.104.237.222', 33382) # 85.104.237.222:33382 95.9.70.61:19130
-                #list_of_peers = [('95.9.70.61', 19130), ('82.222.140.251', 27875), ('78.184.67.162', 56681)] # test code
-                #client._parse_active_peers_for_testing(list_of_peers) # test code
-            except KeyboardInterrupt as e:
-                raise e
-            except Exception as e:
-                # try another tracker port
-                print(e.args)
-                port_index = (port_index + 1) % len(PORTS)
-                success = False
-            
-            port_index = (port_index + 1) % len(PORTS)  
-        
-            if success:
-                tasks_connect = [client.connect_to_peer(peer) \
-                    for peer in client.active_peers.values() if peer] # a list of coros
-                tasks_keep_alive = [client.send_keepalive(peer) \
-                    for peer in client.active_peers.values() if peer] # a list of coros
-                #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
-                #    for peer in client.active_peers.values()]
-                try:
-                    loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive)) # convert coros to tasks
-                except KeyboardInterrupt as e:
-                    print(e.args)
-                except Exception as e:
-                    print(e.args)
-
-                # finished connecting to each peer, now...let's get some pieces
-                while client.open_peers() and not client.all_pieces() and client.piece_cnts:
-                    # at least 1 peer is open and 
-                    # not all pieces are complete and 
-                    # open peer(s) may have pieces that client needs
-                
-                    # each task gets blocks for a piece from a distinct peer
-                    result = client.select_piece() # stores [piece, set-of-peers] in attr
-                    if result == 'success':
-                        index, peers = client.selected_piece_peers
-                        tasks_get_piece = [client.get_piece(index, peer) for peer in peers]
-                    else:
-                        # no pieces in open peers
-                        # connect to tracker
-                        break
-                    try:
-                        loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
-                    except KeyboardInterrupt as e:
-                        print(e.args)
-                        client.shutdown() # send tracker event='stopped'; flush buffer to file system
-                    except Exception as e:
-                        print(e.args)
-                    
-        # download complete
-        print('all pieces downloaded')
-        logging.debug('all pieces downloaded')
-        print('client is a seeder')
-        logging.debug('client is a seeder')
-        client.seeder = True
-        client.TRACKER_EVENT='completed'
-        client.connect_to_tracker(PORTS[port_index], numwant=0)
-
-    if client.seeder:
-        # if buffer is empty, read files from file system into buffer
-        # ...
-
-        # not sure what host= and port= should be.
-        server_coro = asyncio.start_server(client.handle_leecher, host='192.198.0.102', port=61328, loop=loop)
-        server = loop.run_until_complete(server_coro)
-
-        try:
-            loop.run_forever()
-        except (KeyboardInterrupt, OSError) as e:
-            # shutdown server (connection listener)
-            print(e.args)
-            logging.debug(e.args)
-        finally:
-            server.close()
-            loop.run_until_complete(server.wait_closed())
-            client.shutdown()  # tracker event='stopped' # flush buffer to file system
-            loop.close()
-
-
-
-
-
-
-        
+            return msg_ident 
