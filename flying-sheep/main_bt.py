@@ -1,4 +1,4 @@
-
+﻿
 import logging
 import asyncio
 import sys
@@ -7,9 +7,14 @@ from bt_utils import PORTS
 from client import Client
 from torrent_wrapper import TorrentWrapper
 
+@asyncio.coroutine
+def main(client):
+    #client = Client(TorrentWrapper(torrent_file), seeder=False)
 
-def main(torrent_file, loop):
-    client = Client(TorrentWrapper(torrent_file), seeder=False)
+    #server_coro = asyncio.start_server(client.handle_leecher, host='0.0.0.0', port=61328, loop=loop)
+    #task_server = loop.create_task(server_coro)
+    #task_server = loop.create_server(server_coro) # creates server and registers it with loop
+
     if not client.seeder:
         port_index = 0 # tracker port index
         while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
@@ -38,11 +43,12 @@ def main(torrent_file, loop):
                 #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
                 #    for peer in client.active_peers.values()]
                 try:
-                    loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive)) # convert coros to tasks
-                except KeyboardInterrupt as e:
-                    print(e.args)
-                    client.shutdown() # send tracker event='stopped'; flush buffer to file system
-                    raise e
+                    #loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive)) # convert coros to tasks
+                    yield from asyncio.wait(tasks_connect+tasks_keep_alive)
+                #except KeyboardInterrupt as e:
+                #    print(e.args)
+                #    client.shutdown() # send tracker event='stopped'; flush buffer to file system
+                #    raise e
                 except Exception as e:
                     print(e.args)
                     client.shutdown() # send tracker event='stopped'; flush buffer to file system
@@ -64,11 +70,12 @@ def main(torrent_file, loop):
                         # connect to tracker
                         break
                     try:
-                        loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
-                    except KeyboardInterrupt as e:
-                        print(e.args)
-                        client.shutdown() # send tracker event='stopped'; flush buffer to file system
-                        raise e
+                        #loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
+                        yield from asyncio.wait(tasks_get_piece+tasks_keep_alive)
+                    #except KeyboardInterrupt as e:
+                    #    print(e.args)
+                    #    client.shutdown() # send tracker event='stopped'; flush buffer to file system
+                    #    raise e
                     except Exception as e:
                         print(e.args)
                     
@@ -86,22 +93,9 @@ def main(torrent_file, loop):
     if client.seeder:
         # if buffer is empty, read files from file system into buffer
         # ...
+        pass
 
-        # not sure what host= and port= should be.
-        server_coro = asyncio.start_server(client.handle_leecher, host='192.198.0.102', port=61328, loop=loop)
-        server = loop.run_until_complete(server_coro)
 
-        try:
-            loop.run_forever()
-        except (KeyboardInterrupt, OSError) as e:
-            # shutdown server (connection listener)
-            print(e.args)
-            logging.debug(e.args)
-        finally:
-            server.close()
-            loop.run_until_complete(server.wait_closed())
-            client.shutdown()  # tracker event='stopped' # flush buffer to file system
-            loop.close()
 
 ########################################
 
@@ -122,7 +116,28 @@ if __name__ == "__main__":
     logging.basicConfig(filename="bittorrent.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
     logging.captureWarnings(capture=True)
 
-    main(torrent_file, loop)
+    # create client
+    client = Client(TorrentWrapper(torrent_file), seeder=False)
+
+    # schedule client
+    loop.create_task(main(client))
+
+    # create and schedule server
+    server_coro = asyncio.start_server(client.handle_leecher, host='0.0.0.0', port=61328, loop=loop)
+    server = loop.run_until_complete(server_coro) # schedule it
+
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt as e:
+        print(e.args)
+        logging.debug(e.args)
+    finally:
+        # shutdown server (connection listener)
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+        client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
+        loop.close()
+
 
 #torrent_obj = TorrentWrapper("Mozart_mininova.torrent")
 #torrent_obj = TorrentWrapper("Conversations with Google [mininova].torrent")
