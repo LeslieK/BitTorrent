@@ -4,7 +4,6 @@ Dec. 1, 2015
 
 This module is a BitTorrent client without extensions.
 It uploads pieces while it downloads pieces.
-Once it becomes a seeder, it runs a server and uploads pieces.
 
 It uses python 3.4.3 with the asyncio library to achieve concurrency.
 """

@@ -1,4 +1,21 @@
-﻿
+﻿"""
+Leslie B. Klein
+12/2/2015
+
+This is the main module for a bittorrent client/server using the asyncio library.
+
+It creates a server that listens for incoming connections, and handles them
+by responding to the bittorrent handshake.
+
+It creates a client that opens connections to peers, initiates the bittorrent protocol
+with a handshake, and download pieces.
+The client can also respond to requests from remote peers on each connection that it opened.
+
+If the client is constructed as a seeder, the seeder parameter is set to True. Otherwise, seeder is
+set to False by default.
+"""
+
+
 import logging
 import asyncio
 import sys
@@ -14,6 +31,11 @@ def main(client):
     #server_coro = asyncio.start_server(client.handle_leecher, host='0.0.0.0', port=61328, loop=loop)
     #task_server = loop.create_task(server_coro)
     #task_server = loop.create_server(server_coro) # creates server and registers it with loop
+    if client.seeder:
+        # read files from file system into buffer
+        print('client is a seeder')
+        logging.debug('client is a seeder')
+        pass
 
     if not client.seeder:
         port_index = 0 # tracker port index
@@ -25,7 +47,6 @@ def main(client):
                 #client._parse_active_peers_for_testing(list_of_peers) # test code
             except KeyboardInterrupt as e:
                 print(e.args)
-                client.shutdown() # send tracker event='stopped'; flush buffer to file system
                 raise e
             except Exception as e:
                 # try another tracker port
@@ -45,14 +66,10 @@ def main(client):
                 try:
                     #loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive)) # convert coros to tasks
                     yield from asyncio.wait(tasks_connect+tasks_keep_alive)
-                #except KeyboardInterrupt as e:
-                #    print(e.args)
-                #    client.shutdown() # send tracker event='stopped'; flush buffer to file system
-                #    raise e
                 except Exception as e:
                     print(e.args)
-                    client.shutdown() # send tracker event='stopped'; flush buffer to file system
-                    raise e
+                    #client.shutdown() # send tracker event='stopped'; flush buffer to file system
+                    raise KeyboardInterrupt
 
                 # finished connecting to each peer, now...let's get some pieces
                 while client.open_peers() and not client.all_pieces() and client.piece_cnts:
@@ -72,28 +89,19 @@ def main(client):
                     try:
                         #loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
                         yield from asyncio.wait(tasks_get_piece+tasks_keep_alive)
-                    #except KeyboardInterrupt as e:
-                    #    print(e.args)
-                    #    client.shutdown() # send tracker event='stopped'; flush buffer to file system
-                    #    raise e
                     except Exception as e:
                         print(e.args)
+                        raise KeyboardInterrupt
                     
         # download complete
         print('all pieces downloaded')
         logging.debug('all pieces downloaded')
-        print('client is a seeder')
-        logging.debug('client is a seeder')
-        client.seeder = True
         client.TRACKER_EVENT='completed'
         client.connect_to_tracker(PORTS[port_index], numwant=0)
         client.send_not_interested_to_all() # sends Not Interested msg to all open peers
 
 
-    if client.seeder:
-        # if buffer is empty, read files from file system into buffer
-        # ...
-        pass
+
 
 
 
