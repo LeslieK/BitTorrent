@@ -1,4 +1,4 @@
-"""
+﻿"""
 Leslie B. Klein
 Dec. 1, 2015
 
@@ -147,7 +147,7 @@ class Client(object):
         send tracker event='stopped'
         """
         # flush buffer to file
-        if self.pbuffer.piece_info:
+        if not self.seeder and self.pbuffer.piece_info:
             # buffer has at least 1 piece
             logging.debug('shutdown: flushing buffer...')
             print('shutdown: flushing buffer...')
