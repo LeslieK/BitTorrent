@@ -1,20 +1,16 @@
-﻿"""
-Leslie B. Klein
-12/2/2015
-
-This is the main module for a bittorrent client/server using the asyncio library.
-
-It creates a server that listens for incoming connections, and handles them
-by responding to the bittorrent handshake.
-
-It creates a client that opens connections to peers, initiates the bittorrent protocol
-with a handshake, and download pieces.
-The client can also respond to requests from remote peers on each connection that it opened.
-
-If the client is constructed as a seeder, the seeder parameter is set to True. Otherwise, seeder is
-set to False by default.
 """
+Leslie B. Klein
+Date:
 
+This main module runs a client leecher.
+The leecher does not listen for incoming connections. 
+It only initiates connections to a peer and downloads pieces from it.
+This leecher connects directly to (hostname, port) provided on the command line.
+
+The remote peer (seeder) that uploads to this leecher is running main_bt.py in another process.
+The remote peer is exercising its handle_leecher code.
+This leecher is running connect_to_peer and get_next_piece code.
+"""
 
 import logging
 import asyncio
@@ -23,6 +19,7 @@ import sys
 from bt_utils import PORTS, HashError
 from client import Client
 from torrent_wrapper import TorrentWrapper
+from arguments import torrent_file, seeder, hostname, port
 
 @asyncio.coroutine
 def main(client):
@@ -36,15 +33,22 @@ def main(client):
         except (FileNotFoundError, HashError) as e:
             print(e.args)
             raise KeyboardInterrupt from e
+        print("finished reading files into buffer...")
 
     if not client.seeder:
+        print('client is a leecher')
         port_index = 0 # tracker port index
         while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
             try:
-                success = client.connect_to_tracker(PORTS[port_index])  # blocking  # mininova not working today 11/30
-                #client._parse_active_peers_for_testing('85.104.237.222', 33382) # 85.104.237.222:33382 95.9.70.61:19130
-                #list_of_peers = [('95.9.70.61', 19130), ('82.222.140.251', 27875), ('78.184.67.162', 56681)] # test code
-                #client._parse_active_peers_for_testing(list_of_peers) # test code
+                if not hostname:
+                    # connect to tracker
+                    success = client.connect_to_tracker(PORTS[port_index])  # blocking
+                else:
+                    # connect directly to a peer (no tracker)
+                    print('leecher will connect directly to {}:{}'.format(hostname, port))
+                    list_of_peers = [(hostname, port)]  # remote_peer: (host, port)
+                    client._parse_active_peers_for_testing(list_of_peers)
+                    success = True
             except KeyboardInterrupt as e:
                 print(e.args)
                 raise e
@@ -114,14 +118,6 @@ def main(client):
 
 if __name__ == "__main__":
 
-    # get torrent file
-    if len(sys.argv) == 1:
-        torrent_file = "Mozart_mininova.torrent"
-    elif len(sys.argv) > 1 and sys.argv[1].endswith('.torrent'):
-        torrent_file = sys.argv[1]
-    else:
-        raise Exception('usage: >>python main_bt.py <torrentfile.torrent>')
-
     loop = asyncio.get_event_loop()
     loop.set_debug(enabled=True)
 
@@ -130,25 +126,34 @@ if __name__ == "__main__":
     logging.captureWarnings(capture=True)
 
     # create client
-    client = Client(TorrentWrapper(torrent_file), seeder=True)
+    client = Client(TorrentWrapper(torrent_file), seeder=seeder)
 
-    # schedule client
-    loop.create_task(main(client))
+    if seeder:
+        # schedule client
+        loop.create_task(main(client))
 
-    # create and schedule server
-    server_coro = asyncio.start_server(client.handle_leecher, host='0.0.0.0', port=61329, loop=loop)
-    server = loop.run_until_complete(server_coro) # schedule it
+        # create and schedule server
+        server_coro = asyncio.start_server(client.handle_leecher, host=hostname, port=port, loop=loop)
+        server = loop.run_until_complete(server_coro) # schedule it
+        print('seeder is running on {}:{}'.format(hostname, port))
 
 
     try:
-        loop.run_forever()
+        if seeder:
+            loop.run_forever()
+        else:
+            loop.run_until_complete(main(client))
     except KeyboardInterrupt as e:
         print(e.args)
         logging.debug(e.args)
+    except Exception as e:
+        print(e.args)
+        logging.debug(e.args)
     finally:
-        # shutdown server (connection listener)
-        server.close()
-        loop.run_until_complete(server.wait_closed())
+        if seeder:
+            # shutdown server (connection listener)
+            server.close()
+            loop.run_until_complete(server.wait_closed())
         client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
         loop.close()
 

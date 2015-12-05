@@ -180,21 +180,15 @@ class Client(object):
         self.insert_piece(piece_index, piece_bytes)
 
         # delete cache
-        self._cache = None   # error: name self' is not defined (huh?)
+        self._cache = None   
 
     def insert_piece(self, piece_index, piece_bytes):
         """
         seeder client uses this to copy piece from file cache into buffer
         piece_bytes: array.array
         """
-        print('piece_bytes:  index {} data {} length: {}'\
-            .format(piece_index, piece_bytes[:200], len(piece_bytes)))
         row = self.pbuffer.piece_info[piece_index]['row']
-        #self.pbuffer.buffer[row] = piece_bytes
         self.pbuffer.buffer[row].frombytes(piece_bytes.tobytes())
-        print(self.pbuffer.buffer[row][self.torrent.piece_length - 1000:self.torrent.piece_length].tobytes(),)
-        print()
-        print(piece_bytes[self.torrent.piece_length - 1000:self.torrent.piece_length].tobytes(),)
         # check hash
         try:
             assert self.pbuffer._is_piece_hash_good(piece_index)
@@ -494,17 +488,13 @@ class Client(object):
         start = piece_index * self.torrent.piece_length
         file_index = bisect.bisect(self.torrent.file_boundaries_by_byte_indices, start)
         reference = 0 if file_index == 0 else self.torrent.file_boundaries_by_byte_indices[file_index-1]
-        offset = start - reference
-        print('offset: {} piece_index: {} file_index: {}'.format(offset, piece_index, file_index)) 
+        offset = start - reference 
 
         while bytes_left_to_write > 0:
             number_bytes_left_in_file = self.files[file_index]['length'] - offset
             if bytes_left_to_write > number_bytes_left_in_file:
                 # bytes_left_to_write span multiple files
                 number_bytes = number_bytes_left_in_file
-
-                print('about to write file {}: offset {} start {} nbytes {} row {}'\
-                    .format(file_index, offset, start, number_bytes, row))
 
                 self._write(self.output_fds[file_index], offset, start, number_bytes, row)
                 
@@ -1495,6 +1485,9 @@ class Client(object):
 
         read Handshake, write Handshake+bitfield
         """
+        print('in handle_leecher...')
+        logging.debug('in handle_leecher...')
+
         # get peer address
         ip, port = writer.get_extra_info('peername')
         peer = Peer(self.torrent, (ip, port))
@@ -1505,18 +1498,21 @@ class Client(object):
         # expect Handshake
         try:
             msg = yield from reader.readexactly(68)
-        except Exception as e:
+        except Exception("error in waiting for handshake from {}".format(ip)) as e:
             print('handle_leecher: {}'.format(e.args))
             logging.debug('handle_leecher: {}'.format(e.args))
+            raise KeyboardInterrupt from e
         try:
             buf = bytearray(msg)
             msg_ident = self.check_handshake_msg(peer, buf)
-        except ConnectionError as e:
+        except ConnectionError("error in handshake recvd from {}".format(ip)) as e:
             print('handler_leecher: ConnectionError: Received Handshake msg \
             with errors from ip {} {}'.format(ip, e.args))
-        except Exception as e:
+            raise KeyboardInterrupt from e
+        except Exception("other exception reading handshake from {}".format(ip)) as e:
             print('handler_leecher: Other Exception reading Handshake msg \
             from ip {} {}'.format(ip, e.args))
+            raise KeyboardInterrupt from e
 
         if msg_ident == HANDSHAKE_ID:
             # process handshake msg
@@ -1537,10 +1533,10 @@ class Client(object):
         while True:
             # read next msg
             try:
-                yield from self.read_peer()
+                yield from self.read_peer(peer)
             except Exception as e:
                 print(e.args)
-            pass
+                raise KeyboardInterrupt from e
 
     @asyncio.coroutine
     def close_quiet_connections(self, peer):

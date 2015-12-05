@@ -123,8 +123,6 @@ class PieceBuffer(object):
                                     'bitfield': self._init_bitfield(piece_index),
                                     'offset': 0
                                     }
-            #logging.debug('_register_piece: self.free_rows: {} index {}'.format(self.free_rows, piece_index))
-            #print('_register_piece: self.free_rows: {} index {}'.format(self.free_rows, piece_index))
 
     def _sha1_hash(self, piece_index):
         """hash the piece bytes"""
@@ -140,19 +138,14 @@ class PieceBuffer(object):
             piece = self.buffer[row]
         else:
             piece = self.buffer[row][:self.torrent.last_piece_length]
-
-        print('_sha1_hash: piece_index: {} bytes: {} {}'\
-            .format(piece_index, piece[:10], piece[:-5:-1]))
-        logging.debug('_sha1_hash: piece_index: {} bytes: {} {}'\
-            .format(piece_index, piece[:10], piece[:-5:-1]))
         sha1.update(piece)
         return sha1.digest()
 
     def _is_piece_hash_good(self, piece_index):
         torrent_hash_value = self.torrent.get_hash(piece_index)
         piece_hash_value = self._sha1_hash(piece_index)
-        print(torrent_hash_value[:])
-        print(piece_hash_value[:])
+        #print(torrent_hash_value[:])
+        #print(piece_hash_value[:])
         return torrent_hash_value == piece_hash_value
        
     def _is_all_blocks_received(self, piece_index):
