@@ -10,6 +10,7 @@ It uses python 3.4.3 with the asyncio library to achieve concurrency.
 from bcoding import bdecode, bencode
 from collections import defaultdict, Counter
 
+import array
 import math
 import bisect
 import datetime
@@ -17,11 +18,12 @@ import os, socket
 import requests
 import asyncio
 
-from bt_utils import my_peer_id, sha1_info
+from bt_utils import my_peer_id, sha1_info, number_of_blocks
 from bt_utils import rcv_handshake, make_handshake
 from bt_utils import BTState, ChannelState
 from bt_utils import HASH_DIGEST_SIZE
-from bt_utils import ConnectionError, BufferFullError, ProtocolError, ConnectionResetError
+from bt_utils import ConnectionError, BufferFullError, ProtocolError
+from bt_utils import ConnectionResetError, HashError
 from bt_utils import bt_messages, bt_messages_by_name
 
 from bt_utils import DEFAULT_BLOCK_LENGTH
@@ -109,7 +111,6 @@ class Client(object):
 
         self.pbuffer = PieceBuffer(torrent)        # PieceBuffer object
         self.buffer = self.pbuffer.buffer          # buffer attrib of PieceBuffer object; don't expose this
-        self.output_fds = self.open_files()
 
         self.active_peers = {}  # updated with each tracker response; open and not-yet-tried-to-open peers
         self.bt_state = {}      # {ip: BTState()}  choked=1 interested=0
@@ -136,7 +137,75 @@ class Client(object):
         self.server_conn = {} # {ip: peer} # peers initiate connection to client
         self.seeder = seeder
 
+        # used to read files from disk to cache to pbuffer
+        self._cache = array.array('B')
 
+
+    def read_files_into_buffer(self):
+        file_index = 0
+        n_prev = 0
+        for file in self.files:
+            try:
+                with open(os.path.join(ROOT_DIR, file['name']), mode='rb') as f:
+                    n = self.torrent.file_boundaries_by_byte_indices[file_index]
+                    nbytes = n - n_prev
+                    self._cache.fromfile(f, nbytes)
+                    file_index += 1
+                    n_prev = n
+            except Exception as e:
+                print('read_files_into_cache: {}'.format(e.args))
+                logging.debug('read_files_into_cache: {}'.format(e.args))
+                raise KeyboardInterrupt from e
+        self._copy_cache_into_buffer(cache_offset=0)
+
+        
+
+    def _copy_cache_into_buffer(self, cache_offset=0):
+        begin = cache_offset
+        for piece_index in range(self.torrent.number_pieces - 1):
+            self.pbuffer._register_piece(piece_index)
+            piece_length = self.torrent.piece_length
+            # read piece from cache
+            piece_bytes = self._cache[begin:begin+piece_length]  # array.array('B', b'123')
+            # insert piece into buffer
+            self.insert_piece(piece_index, piece_bytes)
+            begin += piece_length
+        # last iteration
+        piece_index = self.torrent.LAST_PIECE_INDEX
+        self.pbuffer._register_piece(piece_index)
+        piece_length = self.torrent.last_piece_length
+        # read piece from cache
+        piece_bytes = self._cache[begin:begin+piece_length]  # array.array('B', b'123')
+        # insert piece into buffer
+        self.insert_piece(piece_index, piece_bytes)
+
+        # delete cache
+        self._cache = None   # error: name self' is not defined (huh?)
+
+    def insert_piece(self, piece_index, piece_bytes):
+        """
+        seeder client uses this to copy piece from file cache into buffer
+        piece_bytes: array.array
+        """
+        print('piece_bytes:  index {} data {} length: {}'\
+            .format(piece_index, piece_bytes[:200], len(piece_bytes)))
+        row = self.pbuffer.piece_info[piece_index]['row']
+        #self.pbuffer.buffer[row] = piece_bytes
+        self.pbuffer.buffer[row].frombytes(piece_bytes.tobytes())
+        print(self.pbuffer.buffer[row][self.torrent.piece_length - 1000:self.torrent.piece_length].tobytes(),)
+        print()
+        print(piece_bytes[self.torrent.piece_length - 1000:self.torrent.piece_length].tobytes(),)
+        # check hash
+        try:
+            assert self.pbuffer._is_piece_hash_good(piece_index)
+        except AssertionError as e:
+            print('{} has bad hash'.format(piece_index))
+            raise HashError from e
+        self.pbuffer.piece_info[piece_index]['all_blocks_received'] = True
+        self.pbuffer.piece_info[piece_index]['hash_verifies'] = True
+        self.pbuffer.piece_info[piece_index]['bitfield'] = \
+            (1 << (number_of_blocks(piece_index, self.torrent) + 1)) - 1
+        self.pbuffer.completed_pieces.add(piece_index)
 
     def shutdown(self):
         """
@@ -157,9 +226,10 @@ class Client(object):
             print('shutdown: flushed buffer')
 
         # close all open files
-        self._close_fds()
-        print('closed all open files...')
-        logging.debug('closed all open files...')
+        if not self.seeder:
+            self._close_fds()
+            print('closed all open files...')
+            logging.debug('closed all open files...')
 
         # shutdown client
         print('client is shutting down...')
@@ -360,7 +430,7 @@ class Client(object):
                 if d and d not in results:
                     try:
                         os.makedirs(name=os.path.join(ROOT_DIR, d), exist_ok=False)
-                    except Exception as e:
+                    except OSError as e:
                         pass
                     results += [d]
 
@@ -372,62 +442,95 @@ class Client(object):
         mode r: if file exists
         mode x: if file does not exist
         """
+        # make dirs if necessary
         if self.torrent.is_multi_file():
             self.create_dirs_for_pieces()
-        fds = []
+
+        # open files
         for file in self.files:
             try:
-                f = open(file['name'], mode='wb')
+                fds = [open(file['name'], mode='wb') for file in self.files]
             except Exception as e:
-                f = open(file['name'], mode='xb')
-            fds += [f]
+                raise KeyboardInterrupt from e
+        #fds = []
+        #for file in self.files:
+        #    try:
+        #        f = open(file['name'], mode='wb')
+        #    except Exception as e:
+        #        f = open(file['name'], mode='xb')
+        #    fds += [f]
         return fds
 
-    def write_buffer_to_file(self, piece_index=None):
+    def write_buffer_to_file(self, reset_buffer=False):
         """
         write piece in buffer to the filesystem using the pathname
         """
-        if piece_index:
-            # write 1 piece to buffer
-            self._write_piece_to_file(piece_index)
-        else:
-            # write entire buffer to file(s)
-            for piece_index in self.pbuffer.pieces_in_buffer():
-                self._write_piece_to_file(piece_index)         
+        # open files
+        self.output_fds = self.open_files()   # moved from init
 
-    def _write_piece_to_file(self, piece_index):
+        # write entire buffer to file(s)
+        try:
+            for piece_index in self.pbuffer.piece_info.keys():
+                self._write_piece_to_file(piece_index)
+        except Exception as e:
+            print('write_buffer_to_file: {}'.format(e.args))
+            raise KeyboardInterrupt from e
+        finally:
+            # close file descriptors
+            self._close_fds()
+                     
+
+    def _write_piece_to_file(self, piece_index, reset_buffer=False):
         """
-        row: indicates buffer row (i.e., piece) to write to file
-        start: byte position in piece
-        reference: byte position indicating beginning of file
-        offset: start - reference: offset into file from head
+        row: indicates buffer row (i.e., piece) to read from
+        start: byte position in piece indicating next byte to write
+        reference: byte position in cache indicating beginning of a file
+        offset: start - reference: offset into a file
         bytes_left: number of bytes in piece that still need to be written to file
         """
         row = self.pbuffer.piece_info[piece_index]['row']
         # write piece to 1 or more files
-        bytes_left = self._piece_length(piece_index)               
+        bytes_left_to_write = self._piece_length(piece_index)               
         start = piece_index * self.torrent.piece_length
         file_index = bisect.bisect(self.torrent.file_boundaries_by_byte_indices, start)
-        reference = 0 if file_index == 0 else self.torrent.file_boundaries_by_byte_indices[file_index]
-        offset = start - reference 
+        reference = 0 if file_index == 0 else self.torrent.file_boundaries_by_byte_indices[file_index-1]
+        offset = start - reference
+        print('offset: {} piece_index: {} file_index: {}'.format(offset, piece_index, file_index)) 
 
-        while bytes_left > 0:
+        while bytes_left_to_write > 0:
             number_bytes_left_in_file = self.files[file_index]['length'] - offset
-            if bytes_left > number_bytes_left_in_file:
-                # bytes_left span multiple files
+            if bytes_left_to_write > number_bytes_left_in_file:
+                # bytes_left_to_write span multiple files
                 number_bytes = number_bytes_left_in_file
-                self._write(self.output_fds[file_index], offset, number_bytes, row)
+
+                print('about to write file {}: offset {} start {} nbytes {} row {}'\
+                    .format(file_index, offset, start, number_bytes, row))
+
+                self._write(self.output_fds[file_index], offset, start, number_bytes, row)
+                
+                bytes_left_to_write -= number_bytes
                 start += number_bytes
-                bytes_left -= number_bytes
                 file_index += 1
                 offset = 0
-            else:          # bytes_left are in a single file
-                self._write(self.output_fds[file_index], offset, bytes_left, row)
-                bytes_left = 0
-        self.pbuffer.reset(piece_index, free_row=True) # removes piece from buffer
+            else:
+                # bytes_left_to_write are in a single file
+                print('about to write file {}: offset {} start {} nbytes {} row {}'\
+                    .format(file_index, offset, start, bytes_left_to_write, row))
 
-    def _write(self, fd, offset, num_bytes, row):  
-        fd.write(self.buffer[row][offset:offset+num_bytes].tobytes())
+                self._write(self.output_fds[file_index], offset, start, bytes_left_to_write, row)
+
+                bytes_left_to_write = 0
+        if reset_buffer:
+            self.pbuffer.reset(piece_index, free_row=True) # removes piece from buffer
+
+    def _write(self, fd, offset, start, num_bytes, row):
+        # begin is 0 or in the middle of a multi-file piece
+        begin = start % self.torrent.piece_length  
+        fd.seek(offset)
+        bytes_ = self.buffer[row][begin:begin+num_bytes].tobytes()  
+        fd.write(bytes_)
+        fd.flush()
+        fd.seek(0)
 
     def _close_fds(self):
         [fd.close() for fd in self.output_fds]
@@ -747,10 +850,10 @@ class Client(object):
                 try:
                     peer.writer.write(NOT_INTERESTED)
                 except Exception as e:
-                    print('send_not_interested_to_all: {} {}'.format(ip, e.args))
-                    logging.debug('send_not_interested_to_all: {} {}'.format(ip, e.args))
-                    pass
-
+                    print('error in sending Not Interested to {} {}'.format(ip, e.args))
+                    logging.debug('error in sending Not Interested to {} {}'.format(ip, e.args))
+                print('send_not_interested_to_all: {}'.format(ip))
+                logging.debug('send_not_interested_to_all: {}'.format(ip))
 
 
     @asyncio.coroutine

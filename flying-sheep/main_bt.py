@@ -20,22 +20,22 @@ import logging
 import asyncio
 import sys
 
-from bt_utils import PORTS
+from bt_utils import PORTS, HashError
 from client import Client
 from torrent_wrapper import TorrentWrapper
 
 @asyncio.coroutine
 def main(client):
-    #client = Client(TorrentWrapper(torrent_file), seeder=False)
 
-    #server_coro = asyncio.start_server(client.handle_leecher, host='0.0.0.0', port=61328, loop=loop)
-    #task_server = loop.create_task(server_coro)
-    #task_server = loop.create_server(server_coro) # creates server and registers it with loop
     if client.seeder:
         # read files from file system into buffer
         print('client is a seeder')
         logging.debug('client is a seeder')
-        pass
+        try:
+            client.read_files_into_buffer()
+        except (FileNotFoundError, HashError) as e:
+            print(e.args)
+            raise KeyboardInterrupt from e
 
     if not client.seeder:
         port_index = 0 # tracker port index
@@ -98,7 +98,12 @@ def main(client):
         logging.debug('all pieces downloaded')
         client.TRACKER_EVENT='completed'
         client.connect_to_tracker(PORTS[port_index], numwant=0)
-        client.send_not_interested_to_all() # sends Not Interested msg to all open peers
+        client.send_not_interested_to_all()
+
+        # copy buffer to filesystem (keep data in buffer)
+        # close file descriptors
+        client.write_buffer_to_file() # files are closed after this completes
+        client.seeder = True  # affects shutdown
 
 
 
@@ -125,14 +130,15 @@ if __name__ == "__main__":
     logging.captureWarnings(capture=True)
 
     # create client
-    client = Client(TorrentWrapper(torrent_file), seeder=False)
+    client = Client(TorrentWrapper(torrent_file), seeder=True)
 
     # schedule client
     loop.create_task(main(client))
 
     # create and schedule server
-    server_coro = asyncio.start_server(client.handle_leecher, host='0.0.0.0', port=61328, loop=loop)
+    server_coro = asyncio.start_server(client.handle_leecher, host='0.0.0.0', port=61329, loop=loop)
     server = loop.run_until_complete(server_coro) # schedule it
+
 
     try:
         loop.run_forever()

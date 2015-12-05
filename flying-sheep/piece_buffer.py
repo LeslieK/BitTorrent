@@ -1,4 +1,4 @@
-
+﻿
 import math
 import hashlib
 import array
@@ -15,13 +15,12 @@ logging.captureWarnings(capture=True)
 class PieceBuffer(object):
     """
     stores the bytes in a piece
-    stores up to BUFFER_SIZE pieces
+    stores up to number_pieces + 1 pieces
     """
     def __init__(self, torrent):
         self.torrent = torrent
-        self.buffer = {row: array.array('B', \
-            bytearray(self.torrent.torrent['info']['piece length'])) \
-            for row in range(self.torrent.number_pieces + 1)}
+        self.buffer = {row: array.array('B') \
+            for row in range(self.torrent.number_pieces)}
         self.free_rows = {i for i in range(self.torrent.number_pieces + 1)}
         self.completed_pieces = set()  # set of completed pieces (indices); store as a client attribute?
         # {'piece index': 20, 'all_bytes_received': False, 'hash_verifies': False, 'bitfield': 1111100000, 'offset': 0x8000}
@@ -39,7 +38,7 @@ class PieceBuffer(object):
 
         piece_index: int
         begin: int
-        block: sequence of bytes (bytearray)
+        block: sequence of bytes: bytearray(b'123')
         """
 
         row = self.piece_info[piece_index]['row']
@@ -101,8 +100,7 @@ class PieceBuffer(object):
 
     def pieces_in_buffer(self):
         """returns an iterator object that iterates over pieces in buffer"""
-        piece_indices = list(self.piece_info.keys())
-        return iter(piece_indices)
+        return self.piece_info.keys()
 
     def is_piece_complete(self, piece_index):
         """
@@ -153,8 +151,8 @@ class PieceBuffer(object):
     def _is_piece_hash_good(self, piece_index):
         torrent_hash_value = self.torrent.get_hash(piece_index)
         piece_hash_value = self._sha1_hash(piece_index)
-        print(torrent_hash_value[:10])
-        print(piece_hash_value[:10])
+        print(torrent_hash_value[:])
+        print(piece_hash_value[:])
         return torrent_hash_value == piece_hash_value
        
     def _is_all_blocks_received(self, piece_index):

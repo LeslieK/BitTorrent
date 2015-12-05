@@ -67,8 +67,10 @@ class ConnectionResetError(Exception):
 class BufferFullError(Exception):
     pass
 
-
 class ProtocolError(Exception):
+    pass
+
+class HashError(Exception):
     pass
 
 def sha1_info(torrent):
@@ -113,6 +115,14 @@ def rcv_handshake(buf):
         msgd['info_hash'] = buf[pstrlen+9:pstrlen+29]
         msgd['peer_id'] = buf[pstrlen+29:pstrlen+49]
     return msgd
+
+def number_of_blocks(piece_index, torrent):
+    if piece_index != torrent.LAST_PIECE_INDEX:
+        number_of_blocks = math.ceil(torrent.piece_length / BLOCK_SIZE) 
+    else:
+        number_of_blocks = math.ceil(torrent.last_piece_length / BLOCK_SIZE)
+    return number_of_blocks
+
 
 
 
