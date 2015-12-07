@@ -156,21 +156,22 @@ if __name__ == "__main__":
         print('seeder is running on {}:{}'.format(hostname, port))
 
 
-    try:
-        if seeder:
+    if seeder:
+        try:
             loop.run_forever()
-        else:
-            loop.run_until_complete(main(client))
-    except KeyboardInterrupt as e:
-        print(e.args)
-        logging.debug(e.args)
-    except Exception as e:
-        print(e.args)
-        logging.debug(e.args)
-    finally:
-        if seeder:
+        except KeyboardInterrupt as e:
+            print(e.args)
+        finally:
             # shutdown server (connection listener)
             server.close()
             loop.run_until_complete(server.wait_closed())
-        client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
-        loop.close()
+            loop.close()
+    else:
+        try:
+            loop.run_until_complete(main(client))
+        except KeyboardInterrupt as e:
+            print('leecher {}'.format(e.args))
+            logging.debug('leecher {}'.format(e.args))
+        finally:
+            client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
+            loop.close()

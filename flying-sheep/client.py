@@ -402,7 +402,7 @@ class Client(object):
 
     def _close_leecher_connection(self, peer):
         """clean-up after failed connection to leecher"""
-        ip, _ = peer.address
+        ip, port = peer.address
         # close leecher connection
         del self.leecher_conn[ip]
         # close reader, writer
@@ -410,8 +410,8 @@ class Client(object):
         peer.writer.close()
         self.closed_leechers_cnt += 1
 
-        logging.debug('{}: cleaned up after closing connection'.format(ip))
-        print('{}: cleaned up after closing connection'.format(ip))
+        logging.debug('{}: cleaned up after closing connection'.format(peer.address))
+        print('{}: cleaned up after closing connection'.format(peer.address))
         return True
 
     def _close_peer_connection(self, peer):
@@ -1501,6 +1501,7 @@ class Client(object):
                 handshake msg unexpectedly received from {}'.format(address))
             # ident Unsupported
             ident = NOTSUPPORTED_ID
+        # update peer time (last time self received a msg from peer)
         peer.timer = datetime.datetime.utcnow()
         print('process_server_read: server successfully read {} from {}'.format(bt_messages[ident], address))  
 
@@ -1538,7 +1539,10 @@ class Client(object):
             # server wrote Piece msg
             if self.leecher_conn[ip].leecher_state == 6:
                 self.leecher_conn[ip].leecher_state = 5
-        print('process_server_write: server successfully wrote {} to ip {}'.format(bt_messages[ident], ip))
+        # update client timer (last time self sends msg to peer)
+        peer._client_keepalive_timer = datetime.datetime.utcnow()
+        print('process_server_write: server successfully wrote {} to {}'\
+            .format(bt_messages[ident], peer.address))
 
     @asyncio.coroutine
     def handle_leecher(self, reader, writer):
@@ -1607,7 +1611,7 @@ class Client(object):
                 yield from self.read_leecher(peer)
             except Exception as e:
                 print(e.args)
-                raise KeyboardInterrupt from e
+                self._close_leecher_connection(peer)
 
     @asyncio.coroutine
     def read_leecher(self, peer):
@@ -2083,5 +2087,7 @@ class Client(object):
                     logging.debug("read_peer: msg_id {} not supported \
                     channel state: {}"\
                         .format(msg_ident, self.channel_state[ip].state))
-                    msg_ident = NOTSUPPORTED_ID    
+                    msg_ident = NOTSUPPORTED_ID
+            print('read_peer: successfully read {} from peer {}'\
+                .format(bt_messages[msg_ident], peer.address))    
             return msg_ident 
