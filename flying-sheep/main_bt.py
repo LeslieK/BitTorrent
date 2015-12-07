@@ -1,15 +1,28 @@
-"""
+﻿"""
 Leslie B. Klein
-Date:
+Date: 12/6/2015
 
-This main module runs a client leecher.
+This main module runs a bittorent leecher or bittorrent seeder (aka server).
+if client.seeder == True: server runs else leecher runs.
+
+# listens to incoming connections
+>> main_bt.py --seeder [-t <file.torrent>]  
+
+# initiates connections; connects to tracker
+>> main_bt.py [-t <file.torrent>]           
+
+# initiates connections; does not connect to tracker
+# connects directly to remote peer (aka seeder, aka server
+>> main_bt.py --hostname='127.0.0.1' [-t <file.torrent>]           
+
 The leecher does not listen for incoming connections. 
 It only initiates connections to a peer and downloads pieces from it.
-This leecher connects directly to (hostname, port) provided on the command line.
 
-The remote peer (seeder) that uploads to this leecher is running main_bt.py in another process.
-The remote peer is exercising its handle_leecher code.
-This leecher is running connect_to_peer and get_next_piece code.
+The remote peer (seeder/server) that uploads to this leecher is running main_bt.py in another process.
+The remote peer is listening for a connection and then exercising the coroutine handle_leecher.
+The leecher is running connect_to_peer and get_next_piece code.
+
+main_bt.py does not run a bittorrent client that downloads pieces and uploads other pieces concurrently.
 """
 
 import logging
@@ -23,6 +36,9 @@ from arguments import torrent_file, seeder, hostname, port
 
 @asyncio.coroutine
 def main(client):
+
+    if hostname:
+        client.USE_TRACKER = False
 
     if client.seeder:
         # read files from file system into buffer
@@ -40,7 +56,7 @@ def main(client):
         port_index = 0 # tracker port index
         while len(client.pbuffer.completed_pieces) != client.torrent.number_pieces:
             try:
-                if not hostname:
+                if client.USE_TRACKER:
                     # connect to tracker
                     success = client.connect_to_tracker(PORTS[port_index])  # blocking
                 else:
@@ -68,11 +84,9 @@ def main(client):
                 #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
                 #    for peer in client.active_peers.values()]
                 try:
-                    #loop.run_until_complete(asyncio.wait(tasks_connect+tasks_keep_alive)) # convert coros to tasks
                     yield from asyncio.wait(tasks_connect+tasks_keep_alive)
                 except Exception as e:
                     print(e.args)
-                    #client.shutdown() # send tracker event='stopped'; flush buffer to file system
                     raise KeyboardInterrupt
 
                 # finished connecting to each peer, now...let's get some pieces
@@ -91,7 +105,6 @@ def main(client):
                         # connect to tracker
                         break
                     try:
-                        #loop.run_until_complete(asyncio.wait(tasks_get_piece+tasks_keep_alive))
                         yield from asyncio.wait(tasks_get_piece+tasks_keep_alive)
                     except Exception as e:
                         print(e.args)
@@ -100,8 +113,9 @@ def main(client):
         # download complete
         print('all pieces downloaded')
         logging.debug('all pieces downloaded')
-        client.TRACKER_EVENT='completed'
-        client.connect_to_tracker(PORTS[port_index], numwant=0)
+        if not client.seeder and not hostname:
+            client.TRACKER_EVENT='completed'
+            client.connect_to_tracker(PORTS[port_index], numwant=0)
         client.send_not_interested_to_all()
 
         # copy buffer to filesystem (keep data in buffer)
@@ -117,12 +131,16 @@ def main(client):
 ########################################
 
 if __name__ == "__main__":
+    """
+    This script lets the seeder (aka server) run forever.
+    It lets the leecher run until main() completes, which happens when leecher downloads all pieces.
+    """
 
     loop = asyncio.get_event_loop()
     loop.set_debug(enabled=True)
 
     logger = logging.getLogger('asyncio')
-    logging.basicConfig(filename="bittorrent.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
+    logging.basicConfig(filename="bittorrent_seeder.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
     logging.captureWarnings(capture=True)
 
     # create client
@@ -133,7 +151,7 @@ if __name__ == "__main__":
         loop.create_task(main(client))
 
         # create and schedule server
-        server_coro = asyncio.start_server(client.handle_leecher, host=hostname, port=port, loop=loop)
+        server_coro = asyncio.start_server(client.handle_leecher, host='127.0.0.1', port=port, loop=loop)
         server = loop.run_until_complete(server_coro) # schedule it
         print('seeder is running on {}:{}'.format(hostname, port))
 
@@ -156,10 +174,3 @@ if __name__ == "__main__":
             loop.run_until_complete(server.wait_closed())
         client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
         loop.close()
-
-
-#torrent_obj = TorrentWrapper("Mozart_mininova.torrent")
-#torrent_obj = TorrentWrapper("Conversations with Google [mininova].torrent")
-#torrent_obj = TorrentWrapper("Trigger Hippy Gorman Herring Freed Govrik - Live in Macon GA [mininova].torrent")
-#torrent_obj = TorrentWrapper("A Free educational book for teaching english and english teachers [mininova].torrent")
-#torrent_obj = TorrentWrapper("Noah Cohn - Devils Tongue [mininova].torrent")

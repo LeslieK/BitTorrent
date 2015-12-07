@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 
 # parse command line arguments
 parser = argparse.ArgumentParser(description='run a bittorrent client')
@@ -9,7 +9,7 @@ parser.add_argument("-t", "--torrent_file", type=str, default="Mozart_mininova.t
 
 # hostname default is None
 # default causes leecher to connect to tracker
-parser.add_argument("-n", "--hostname", type=str, \
+parser.add_argument("-n", "--hostname", type=str, default='',\
     help="ip address of a seeder peer")
 parser.add_argument("-p", "--port", type=int, default=61329,\
     help="port number of remote peer on remote host")
@@ -21,4 +21,4 @@ seeder = args.seeder
 hostname = args.hostname
 port = args.port
 
-remote_peer = ('localhost', 61329)
+remote_peer = ('', 61329)

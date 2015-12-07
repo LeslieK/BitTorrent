@@ -66,8 +66,8 @@ class Peer(object):
 
         # bt_state = choked by client, interested in client
         self.bt_state = BTState() # choked = 1, interested = 0
-        # for a peer that initiates connection to client
-        self.download_state = 0
+        # state of leecher peer (leecher initiates connection to seeder)
+        self.leecher_state = 0
 
         # peer keepalive timer (reset when client receives msg from peer)
         self.timer = datetime.datetime.utcnow()
@@ -92,6 +92,8 @@ class Client(object):
     def __init__(self, torrent, seeder=False):
         self.peer_id = my_peer_id()
         self.torrent = torrent
+        self.seeder = seeder
+        self.USE_TRACKER = True # set to False by main() when in trackerless mode
 
         self.files = self.torrent.file_meta
         self.HANDSHAKE = make_handshake(self.torrent.INFO_HASH, self.peer_id)  
@@ -129,16 +131,23 @@ class Client(object):
         self.TRACKER_EVENT = 'started'
 
         # used by _get_next_piece
-        self.selected_piece_peer = [] # [piece_index, peer] NOT USED since refactoring
+        #self.selected_piece_peer = [] # [piece_index, peer] NOT USED since refactoring
         self.selected_piece_peers = [] # [piece_index, <set of peers>]
 
-        # used by server (uploader)
+        # used when uploading (server)
         self.number_unchoked_peers = 0
-        self.server_conn = {} # {ip: peer} # peers initiate connection to client
-        self.seeder = seeder
+        # used by server (listens for incoming (leecher) connections)
+        self.leecher_conn = {} # {ip: peer} # leechers initiate connection to client
+        # store server state:
+        # choked/not-choked by leecher
+        # interested/not-interested in leecher
+        self.server_bt_state = {} # {ip: BTState(choked=0, interested=0)}
+        self.closed_leechers_cnt = 0
+
 
         # used to read files from disk to cache to pbuffer
         self._cache = array.array('B')
+        self.output_fds = None # list of file descriptors for writing pieces
 
 
     def read_files_into_buffer(self):
@@ -179,6 +188,9 @@ class Client(object):
         # insert piece into buffer
         self.insert_piece(piece_index, piece_bytes)
 
+        # set bit in piece bitfield
+        self.update_bitfield(list(range(self.torrent.number_pieces)))
+
         # delete cache
         self._cache = None   
 
@@ -198,8 +210,10 @@ class Client(object):
         self.pbuffer.piece_info[piece_index]['all_blocks_received'] = True
         self.pbuffer.piece_info[piece_index]['hash_verifies'] = True
         self.pbuffer.piece_info[piece_index]['bitfield'] = \
-            (1 << (number_of_blocks(piece_index, self.torrent) + 1)) - 1
+            (1 << (number_of_blocks(piece_index, self.torrent) + 1)) - 1 # all 1s
         self.pbuffer.completed_pieces.add(piece_index)
+
+
 
     def shutdown(self):
         """
@@ -209,7 +223,7 @@ class Client(object):
         send tracker event='stopped'
         """
         # flush buffer to file
-        if not self.seeder and self.pbuffer.piece_info:
+        if not self.seeder and not self._is_bitfield_all_0s():
             # buffer has at least 1 piece
             logging.debug('shutdown: flushing buffer...')
             print('shutdown: flushing buffer...')
@@ -220,7 +234,7 @@ class Client(object):
             print('shutdown: flushed buffer')
 
         # close all open files
-        if not self.seeder:
+        if not self.seeder and self.output_fds: # leecher has opened file(s)
             self._close_fds()
             print('closed all open files...')
             logging.debug('closed all open files...')
@@ -229,22 +243,26 @@ class Client(object):
         print('client is shutting down...')
         logging.debug('client is shutting down...')
 
-        success = all([self._close_peer_connection(peer) for ip, peer in self.open_peers().items()])
+        success = all([self._close_peer_connection(peer) \
+            for ip, peer in self.open_peers().items()]) and \
+            all([self._close_leecher_connection(peer) \
+            for ip, peer in self.open_leechers().items()])
         if success:
-            # successfully closed all open peers
-            try:
-                self.TRACKER_EVENT = 'stopped'
-                r = self.connect_to_tracker(PORTS[0], numwant=0)
-            except Exception as e:
-                print('client shutdown error: {}'.format(e.args))
-                logging.debug('client shutdown error: {}'.format(e.args))
+            # successfully closed all open peers and leechers
+            if self.USE_TRACKER:
+                try:
+                    self.TRACKER_EVENT = 'stopped'
+                    r = self.connect_to_tracker(PORTS[0], numwant=0)
+                except Exception as e:
+                    print('shutdown: error in connecting to tracker {}'.format(e.args))
+                    logging.debug('shutdown: error in connecting to tracker {}'.format(e.args))
             print('shutdown: client completed shutdown')
             logging.debug('shutdown: client completed shutdown')
             return True
         else:
-            # client did not close all open peers
-            print('client shutdown failed')
-            logging.debug('client shutdown failed')
+            # client did not close all open peers and leechers
+            print('shutdown: client did not close all open peers/leechers')
+            logging.debug('shutdown: client did not close all open peers/leechers')
             return False
 
     def _parse_active_peers_for_testing(self, address_list):
@@ -361,14 +379,40 @@ class Client(object):
         self.num_peers = len(self.active_peers)  # number of open and not-yet-connected-to peers
 
     def open_peers(self):
+        """
+        returns dict of all open peer connections
+        """
         if not self.active_peers:
             return {}
         else:
             return {ip:peer for ip, peer in self.active_peers.items() if self.channel_state[ip].open}
 
+    def open_leechers(self):
+        """
+        returns dict of all open leecher connections
+        """
+        if not self.leecher_conn:
+            return {}
+        else:
+            return {ip:peer for ip, peer in self.leecher_conn.items()}
+
     def reset_keepalive(self, peer):
         # timer stores the last time client wrote to peer
         peer._client_keepalive_timer = datetime.datetime.utcnow()
+
+    def _close_leecher_connection(self, peer):
+        """clean-up after failed connection to leecher"""
+        ip, _ = peer.address
+        # close leecher connection
+        del self.leecher_conn[ip]
+        # close reader, writer
+        peer.reader.set_exception(None)
+        peer.writer.close()
+        self.closed_leechers_cnt += 1
+
+        logging.debug('{}: cleaned up after closing connection'.format(ip))
+        print('{}: cleaned up after closing connection'.format(ip))
+        return True
 
     def _close_peer_connection(self, peer):
         """clean-up after failed connection to peer"""
@@ -398,11 +442,12 @@ class Client(object):
         ip, _ = peer.address
         peer.reader = reader
         peer.writer = writer
+        peer.writer.write(self.HANDSHAKE)
         self.channel_state[ip].open = 1
         self.channel_state[ip].state = 1
         logging.debug('write Handshake to {}'.format(ip))
         print('write Handshake to {}'.format(ip))
-        peer.writer.write(self.HANDSHAKE)
+        #peer.writer.write(self.HANDSHAKE)
         self.reset_keepalive(peer)
 
     def _length_of_last_piece(self):
@@ -457,7 +502,7 @@ class Client(object):
 
     def write_buffer_to_file(self, reset_buffer=False):
         """
-        write piece in buffer to the filesystem using the pathname
+        write all pieces in buffer to the filesystem using the pathname
         """
         # open files
         self.output_fds = self.open_files()   # moved from init
@@ -532,6 +577,9 @@ class Client(object):
         max_i = num_bytes * 8 - 1
         return max_i - an_index
 
+    def _is_bitfield_all_0s(self):
+        return self.bitfield & (self.bitfield - 1) == 0
+
     def init_bitfield(self, list_of_pieces=None):
         """initialize bitfield; each bit represents a piece of the torrent
         
@@ -558,7 +606,7 @@ class Client(object):
 
     def int_to_bitstring(self):
         """bitfield is an int
-        bitfield: 0b1---- ---- (ignore leftmost 1)
+        bitfield: 0b1---- ---- (ignore leftmost 1 after converting int)
         return a bitstring
         """    
         bitstring = bin(self.bitfield)[2:]
@@ -588,9 +636,9 @@ class Client(object):
     def make_bitfield_msg(self):
         """convert self.bitfield from int to a bit string"""
         num_bytes = math.ceil(self.torrent.number_pieces / 8)
-        length = self._int_to_4bytes(num_bytes) + 1
+        length = self._int_to_4bytes(num_bytes+1)
         ident = bytes([5])
-        bitfield = self.int_to_bitstring(self.bitfield)
+        bitfield = self.int_to_bitstring()
         return length + ident + bitfield
 
     def make_have_msg(self, piece_index):
@@ -637,7 +685,7 @@ class Client(object):
         length = 9 + len(ablock)
         return length + ident + index + begin + ablock
 
-    def make_piece_msg(index, begin, length_of_block):
+    def make_piece_msg(self, index, begin, length_of_block):
         length = self._int_to_4bytes(9 + length_of_block)
         ident = bytes([7])
         piece_index = self._int_to_4bytes(index)
@@ -732,7 +780,6 @@ class Client(object):
         # update data structures
         for index in self.active_peers[ip].has_pieces:
             self.piece_to_peers[index].add(ip)
-            #self.peer_to_pieces[ip].add(index)
             if index not in self.pbuffer.completed_pieces:
                 self.piece_cnts[index] += 1
         return msgd
@@ -826,7 +873,7 @@ class Client(object):
         returns requested block from buffer
         """
         row = self.pbuffer.piece_info[index]['row']
-        block = self.pbuffer.buffer[row][offset:length_of_block].tobytes()
+        block = self.pbuffer.buffer[row][offset:offset+length_of_block].tobytes()
         return block
 
     def send_not_interested_to_all(self):
@@ -848,9 +895,15 @@ class Client(object):
 
     @asyncio.coroutine
     def send_piece_msg(self, peer, msgd):
+        """
+        buf: bytearray(request msg)
+        constructs Piece msg from Request msg
+        writes Piece msg to peer
+        return Piece msg
+        """
         index = msgd['index']
         begin = msgd['begin']
-        block_length = msgd['length']
+        block_length = msgd['block_length']
         msg = self.make_piece_msg(index, begin, block_length)
         try:
             peer.writer.write(msg)
@@ -861,6 +914,7 @@ class Client(object):
             logging.debug('send_piece_msg: error in writing msg to {} index {} begin {}'\
                 .format(peer.address[0], index, begin))
             raise e
+        return msg
         
     def is_block_received(self, index, begin):
         """
@@ -1000,7 +1054,7 @@ class Client(object):
             except AssertionError as e:
                 print("check_handshake_msg: received handshake\
                 msg with length {}; should be 19".format(buf[0].decode()))
-                raise ConnectionError("check_handshake_msg: \
+                raise ProtocolError("check_handshake_msg: \
                 received handshake msg with length {}; should be 19"\
                     .format(buf[0].decode()))
             #  handshake message
@@ -1011,7 +1065,7 @@ class Client(object):
             except AssertionError as e:
                 print("check_handshake_msg: peer is not part of torrent:\
                 expected hash: {}".format(self.torrent.INFO_HASH))
-                raise ConnectionError("check_handshake_msg: \
+                raise ProtocolError("check_handshake_msg: \
                 peer is not part of torrent: expected hash: {}"\
                     .format(self.torrent.INFO_HASH))
 
@@ -1044,12 +1098,14 @@ class Client(object):
         else:
             piece_length = self.piece_length
         try:
-            assert begin + block_length < piece_length
+            assert begin + block_length <= piece_length
         except AssertionError as e:
             print('check_request_msg: {}'.format(e.args))
             logging.debug('check_request_msg: {}'.format(e.args))
             raise ProtocolError('check_request_msg: begin + block_length \
             exceeds piece length index {}'.format(index))
+        except Exception as e:
+            print(e.args)
 
     def check_bitfield_msg(self, msgd):
         """
@@ -1352,38 +1408,42 @@ class Client(object):
 
         Handshake, Bitfield
         Have
+        Choke
         Interested, Not Interested
         Request
         Cancel
         """
-        ip, _ = peer.address
+        print('in process_server_read...')
+
+        address = peer.address
+        ip, port = address
         buf = bytearray(msg)
         ident = buf[4]
 
-        if ident == HANDSHAKE_ID:
-            # Handshake msg
-            if peer[ip].download_state == 0:
-                peer[ip].download_state = 1
+        if ident == 0:
+            # server reads choke msg
+            self.server_bt_state[ip].choked = 1
         elif ident == 2:
-            # Interested msg
+            # server reads Interested msg
             
             length = self._4bytes_to_int(buf[0:4])
             try: 
                 assert length == 1
             except AssertionError:
-                raise ConnectionError("Interested: bad length  received: {} expected: 1"\
-                                        .format(length))
-            peer.timer = datetime.datetime.utcnow()
-            peer.bt_state.interested = 1  # peer is interested in client
+                raise ProtocolError("Interested: bad length received from {}: expected: 1"\
+                                        .format(address))
+            peer.bt_state.interested = 1  # peer is interested in server
+            if self.leecher_conn[ip].leecher_state == 2:
+                self.leecher_conn[ip].leecher_state = 4
             # unchoke peer
-            if self.number_unchoked_peers < MAX_UNCHOKED_PEERS:
+            if peer.bt_state.choked and self.number_unchoked_peers < MAX_UNCHOKED_PEERS:
                 self.send_unchoke_msg(peer)
+                self.process_server_write(peer, UNCHOKE)
                 self.number_unchoked_peers += 1
-                print('process_server_read: sent unchoke msg to {} number unchoked peers {}'\
-                    .format(ip, self.number_unchoked_peers))
+                peer.bt_state.choked = 0        
                 logging.debug('process_server_read: sent unchoke msg to {} number unchoked peers {}'\
-                    .format(ip, self.number_unchoked_peers))
-            else:
+                    .format(address, self.number_unchoked_peers))
+            elif peer.bt_state.choked:
                 # choke an unchoked peer to unchoke this one
                 # or do nothing
                 print('process_read_msg: number of unchoked peers is {}'\
@@ -1391,91 +1451,94 @@ class Client(object):
                 logging.debug('process_read_msg: number of unchoked peers is {}'\
                     .format(MAX_UNCHOKED_PEERS))
         elif ident == 3:
-            # Not Interested mg
+            # server reads Not Interested mg
             length = self._4bytes_to_int(buf[0:4])
             try: 
                 assert length == 1
             except AssertionError:
-                raise ConnectionError("Not Interested: bad length  received: {} expected: 1"\
-                                        .format(length))
-            peer.timer = datetime.datetime.utcnow()
+                raise ProtocolError("Not Interested: bad length received from {} expected: 1"\
+                                        .format(address))
             peer.bt_state.interested = 0  # peer is not interested in client
             # send peer Choke msg
             if peer.bt_state.choked == 0: # unchoked
                 self.send_choke_msg(peer)
-                self.number_unchoked_peers -= 1
                 self.process_server_write(peer, CHOKE)
+                peer.bt_state.choked = 1
+                self.number_unchoked_peers -= 1
         elif ident == 6:
-            # Request msg
-            peer.timer = datetime.datetime.utcnow()
+            # server reads Request msg
             msgd = self._parse_request_msg(buf)
-
             # check request message
             try:
                 self.check_request_msg(msgd)
             except Exception as e:
-                raise ProtocolError('check_request_msg: {}'.format(e.args))
+                raise ProtocolError('check_request_msg: \
+                received bad request from {}: {}'.format(address, e.args))
 
-            if self.server_conn[ip].download_state == 5:
-                self.server_conn[ip].download = 6
+            if self.leecher_conn[ip].leecher_state == 5:
+                self.leecher_conn[ip].leecher_state = 6
 
             # peer requests block from client
-            if peer.bt_state.interested and not peer.bt_state.choked:
+            if peer.bt_state.interested and not peer.bt_state.choked and \
+                not self.server_bt_state[ip].choked:
                 # send piece msg
                 try:
-                    yield from self.send_piece_msg(peer, msgd) # client sends piece message
+                    piece_msg = yield from self.send_piece_msg(peer, msgd) # server sends piece message
                 except Exception as e:
-                    self._close_peer_connection(peer)
+                    raise ProtocolError('process_server_read: \
+                    error in sending {} to {}'\
+                        .format(bt_messages[ident], address))
                 peer.number_bytes_downloaded += msgd['length']
-                self.process_server_write(msg)
+                self.process_server_write(peer, piece_msg)  # fix this
         elif ident == 8:
             # Cancel msg
             # client must cancel associated request
             pass
         else:
+            # check if handshake msg; if yes, close_connection to leecher
+            if HANDSHAKE_ID == self.check_handshake_msg(peer, buf):
+                raise ProtocolError('process_server_read: \
+                handshake msg unexpectedly received from {}'.format(address))
             # ident Unsupported
-            pass  
+            ident = NOTSUPPORTED_ID
+        peer.timer = datetime.datetime.utcnow()
+        print('process_server_read: server successfully read {} from {}'.format(bt_messages[ident], address))  
 
     def process_server_write(self, peer, msg):
         """
         runs state machine on incoming connections
 
         """
+        print('in process_server_write...')
+
         ip, _ = peer.address
         buf = bytearray(msg)
         ident = buf[4]
 
-        if ident == HANDSHAKE_ID:
-            # server wrote Handshake+Bitfield in respose to peer Handshake
-            if self.server_state[ip] == 1:
-                self.server_state[ip] = 2
-            else:
-                raise ProtocolError('process_server_write: client wrote Handshake to ip {} from state {}'\
-                    .format(ip, self.server_state[ip]))
-        elif ident == 0:
-            # server wrote Unchoke msg
-            if self.server_state[ip] == 2:
-                self.server_state[ip] = 3
-            elif self.server_state[ip] == 4:
-                self.server_state[ip] = 5
-        elif ident == 1:
+        if ident == 0:
             # server wrote Choke msg
-            if self.server_state[ip] == 3:
-                self.server_state[ip] = 2
-            elif self.server_state[ip] == 5:
-                self.server_state[ip] = 4
+            if self.leecher_conn[ip].leecher_state == 3:
+                self.leecher_conn[ip].leecher_state = 2
+            elif self.leecher_conn[ip].leecher_state == 5:
+                self.leecher_conn[ip].leecher_state = 4
+        elif ident == 1:
+            # server wrote Unchoke msg           
+            if self.leecher_conn[ip].leecher_state == 2:
+                self.leecher_conn[ip].leecher_state = 3
+            elif self.leecher_conn[ip].leecher_state == 4:
+                self.leecher_conn[ip].leecher_state = 5
         elif ident == 4:
             # server wrote Have msg
             pass
         elif ident == 5:
-            # server wrote Bit msg
-            # won't happen; covered in ident=Handshake_ID
-            pass
+            # server wrote Bitfield msg (always follows Handshake)
+            if self.leecher_conn[ip].leecher_state == 10:
+                self.leecher_conn[ip].leecher_state = 2
         elif ident == 7:
-            # server writes Piece msg
-            # server get bytes from its buffer
-            if self.server_state[ip] == 6:
-                self.server_state[ip] = 5
+            # server wrote Piece msg
+            if self.leecher_conn[ip].leecher_state == 6:
+                self.leecher_conn[ip].leecher_state = 5
+        print('process_server_write: server successfully wrote {} to ip {}'.format(bt_messages[ident], ip))
 
     @asyncio.coroutine
     def handle_leecher(self, reader, writer):
@@ -1491,6 +1554,8 @@ class Client(object):
         # get peer address
         ip, port = writer.get_extra_info('peername')
         peer = Peer(self.torrent, (ip, port))
+        peer.reader = reader
+        peer.writer = writer
 
         print('in handle_leecher peername: {}:{}'.format(ip, port))
         logging.debug('in handle_leecher peername: {}:{}'.format(ip, port))
@@ -1501,30 +1566,36 @@ class Client(object):
         except Exception("error in waiting for handshake from {}".format(ip)) as e:
             print('handle_leecher: {}'.format(e.args))
             logging.debug('handle_leecher: {}'.format(e.args))
-            raise KeyboardInterrupt from e
+            self._close_leecher_connection(peer)
         try:
             buf = bytearray(msg)
             msg_ident = self.check_handshake_msg(peer, buf)
-        except ConnectionError("error in handshake recvd from {}".format(ip)) as e:
-            print('handler_leecher: ConnectionError: Received Handshake msg \
+        except ProtocolError("error in handshake recvd from {}".format(ip)) as e:
+            print('handler_leecher: ProtocolError: Received Handshake msg \
             with errors from ip {} {}'.format(ip, e.args))
-            raise KeyboardInterrupt from e
+            self._close_leecher_connection(peer)
         except Exception("other exception reading handshake from {}".format(ip)) as e:
             print('handler_leecher: Other Exception reading Handshake msg \
             from ip {} {}'.format(ip, e.args))
-            raise KeyboardInterrupt from e
+            self._close_leecher_connection(peer)
 
-        if msg_ident == HANDSHAKE_ID:
-            # process handshake msg
-            self.server_conn[ip] = peer
-            self.process_server_read(peer, msg)
-        else:
-            raise ProtocolError('handle_leecher: first msg must be Handshake')
+        # process handshake msg
+        peer.timer = datetime.datetime.utcnow()
+        peer.leecher_state = 1  # conn is open
+        self.leecher_conn[ip] = peer  # add leecher to leechers
+        # leecher does not choke server and server is not interested in leecher
+        self.server_bt_state[ip] = BTState(choked=0, interested=0) 
 
         # write handshake msg and bitfield msg
+        # first write handshake
+        peer.writer.write(self.HANDSHAKE)
+        if self.leecher_conn[ip].leecher_state == 1:
+            self.leecher_conn[ip].leecher_state = 10
+        # then write bitfield msg
         msg = self.make_bitfield_msg()
-        self.writer.write(self.HANDSHAKE + msg)
-        # process_server_write
+        peer.writer.write(msg)
+        self.process_server_write(peer, msg)
+        # update client timer
         peer._client_keepalive_timer = datetime.datetime.utcnow()
         print('handle_leecher: wrote Handshake to {}'.format(ip))
         print('handle_leecher: wrote Bitfield to {}'.format(ip))
@@ -1533,10 +1604,72 @@ class Client(object):
         while True:
             # read next msg
             try:
-                yield from self.read_peer(peer)
+                yield from self.read_leecher(peer)
             except Exception as e:
                 print(e.args)
                 raise KeyboardInterrupt from e
+
+    @asyncio.coroutine
+    def read_leecher(self, peer):
+        """
+        seeder listens to remote peer for a message
+        it then calls process_server_read
+        """
+        ip, _ = peer.address
+        reader = peer.reader
+
+        logging.debug('in read_leecher')
+        print('in read_leecher')
+
+
+        try:
+            msg_length = yield from reader.readexactly(4)
+        except (TimeoutError, OSError) as e:
+            logging.debug("read_leecher {}: caught error from reading msg[0:4]: {}".format(ip, e.args))
+            print("read_leecher {}: caught error from reading msg[0:4]: {}".format(ip, e.args))
+            raise ProtocolError('error in reading msg[0:4]') from e
+        except Exception as e:
+            logging.debug("read_leecher {}: Other Exception".format(ip, e.args))
+            print("read_leecher {}: Other Exception".format(ip, e.args))
+            raise ProtocolError('error in reading msg[0:4]') from e
+        if not msg_length:
+            raise ProtocolError('read_leecher: msg_length is undefined')
+        if msg_length == KEEPALIVE:
+            peer.timer = datetime.datetime.utcnow()
+            print('read_leecher: received Keep-Alive from peer {}'.format(ip))
+        else:
+            try:
+                msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
+            except (TimeoutError, OSError) as e:
+                logging.debug("read_leecher {}: caught error from body {}".format(ip, e.args))
+                print("read_leecher {}: caught error from body {}".format(ip, e.args))
+                raise ProtocolError('read_leecher: error in reading msg body \
+                from {}: {}'.format(address, e.args))
+            except Exception as e:
+                logging.debug("read_leecher {}: caught Other Exception {}".format(ip, e.args))
+                print("read_leecher {}: caught error from body {}".format(ip, e.args))
+                raise ProtocolError('read_leecher: caught Other Exception in msg body \
+                from {}: {}'.format(address, e.args))
+            msg_ident = msg_body[0]
+            if msg_ident in list(range(10)):
+                # processing the read leecher msg happens here
+                try:
+                    yield from self.process_server_read(peer, msg_length+msg_body)
+                except (ProtocolError, Exception) as e:
+                    raise ProtocolError from e
+            else:
+                # msg_ident not supported
+                logging.debug("read_leecher: msg_id {} not supported leecher state {}"
+                    .format(msg_ident, self.leecher_conn[ip].leecher_state))
+                print("read_leecher: msg_id {} not supported leecher state {}"
+                    .format(msg_ident, self.leecher_conn[ip].leecher_state))
+                msg_ident = NOTSUPPORTED_ID
+        return msg_ident
+
+
+
+
+
 
     @asyncio.coroutine
     def close_quiet_connections(self, peer):
