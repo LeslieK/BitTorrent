@@ -8,9 +8,8 @@ import logging
 from bt_utils import BufferFullError
 from bt_utils import BLOCK_SIZE
 
-logger = logging.getLogger('asyncio')
-logging.basicConfig(filename="bittorrent.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
-logging.captureWarnings(capture=True)
+module_logger = logging.getLogger(__name__)
+
 
 class PieceBuffer(object):
     """
@@ -18,6 +17,9 @@ class PieceBuffer(object):
     stores up to number_pieces + 1 pieces
     """
     def __init__(self, torrent):
+        self.logger = logging.getLogger('main_bt.piece_buffer.PieceBuffer')
+        self.logger.info('creating a PieceBuffer instance')
+
         self.torrent = torrent
         self.buffer = {row: array.array('B') \
             for row in range(self.torrent.number_pieces)}
@@ -47,13 +49,13 @@ class PieceBuffer(object):
         ablock = array.array('B', block)
         self.buffer[row][begin:begin+len(ablock)] = ablock
 
-        logging.debug('insert_bytes: length(ablock) = {}, {}'.format(len(ablock), ablock[:5]))
-        print('insert_bytes: length(block) = {}, {}'.format(len(ablock), ablock[:5]))
+        self.logger.info('insert_bytes: length(ablock) = {}, {}'.format(len(ablock), ablock[:5]))
+        #print('insert_bytes: length(block) = {}, {}'.format(len(ablock), ablock[:5]))
 
-        logging.debug('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
+        self.logger.info('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
             .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
-        print('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
-            .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
+        #print('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
+        #    .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
 
         # update bitfield (each bit represents a block in the piece)
         #self._update_bitfield(piece_index)
@@ -66,8 +68,8 @@ class PieceBuffer(object):
                 # all bytes received
                 self.piece_info[piece_index]['all_blocks_received'] = True
                 # piece hash matches torrent hash
-                print('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
-                logging.debug('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
+                #print('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
+                self.logger.info('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
                 self.piece_info[piece_index]['hash_verifies'] = True
                 self.completed_pieces.add(piece_index)  # set of piece indices
                 return 'done'
@@ -113,8 +115,8 @@ class PieceBuffer(object):
         try:
             row = self.free_rows.pop()
         except KeyError as e:
-            logging.debug("Buffer is full")
-            print("Buffer is full")
+            self.logger.info("Buffer is full")
+            #print("Buffer is full")
             raise BufferFullError("Buffer is full")
         else:
             self.piece_info[piece_index] = {'row': row,
@@ -144,8 +146,8 @@ class PieceBuffer(object):
     def _is_piece_hash_good(self, piece_index):
         torrent_hash_value = self.torrent.get_hash(piece_index)
         piece_hash_value = self._sha1_hash(piece_index)
-        #print(torrent_hash_value[:])
-        #print(piece_hash_value[:])
+        self.logger.debug(torrent_hash_value[:10])
+        self.logger.debug(piece_hash_value[:10])
         return torrent_hash_value == piece_hash_value
        
     def _is_all_blocks_received(self, piece_index):
@@ -153,8 +155,7 @@ class PieceBuffer(object):
         returns True if bitfield has no "0"
         """
         bf = bin(self.piece_info[piece_index]['bitfield'])[3:]
-        print('_is_all_blocks_received: blocks bitfield: {}'.format(bf))
-        logging.debug('_is_all_blocks_received: blocks bitfield: {}'.format(bf))
+        self.logger.info('_is_all_blocks_received: blocks bitfield: {}'.format(bf))
         return not('0' in bf)
 
     def _init_bitfield(self, piece_index):
@@ -187,14 +188,14 @@ class PieceBuffer(object):
 
         bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
         length = len(bfs)
-        logging.debug('_update_bitfield (pbuffer): {} block number: {}'\
+        self.logger.info('_update_bitfield (pbuffer): {} block number: {}'\
             .format(bfs[length-1-block_number], block_number))
-        print('_update_bitfield (pbuffer): {} block number: {}'\
-            .format(bfs[length-1-block_number], block_number))
+        #print('_update_bitfield (pbuffer): {} block number: {}'\
+        #    .format(bfs[length-1-block_number], block_number))
 
         self.piece_info[piece_index]['bitfield'] |= 1 << block_number
 
         bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
         length = len(bfs)
-        logging.debug('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
-        print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
+        self.logger.info('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
+        #print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))

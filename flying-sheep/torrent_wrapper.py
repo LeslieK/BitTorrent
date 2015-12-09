@@ -1,4 +1,4 @@
-
+﻿
 from bcoding import bdecode
 #from collections import defaultdict, Counter
 import math
@@ -9,9 +9,29 @@ import logging
 from bt_utils import sha1_info # my_peer_id
 from bt_utils import HASH_DIGEST_SIZE
 
-logger = logging.getLogger('asyncio')
-logging.basicConfig(filename="bittorrent.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
-logging.captureWarnings(capture=True)
+# create logger for torrent_wrapper module
+module_logger = logging.getLogger(__name__)
+#logger.setLevel(logging.DEBUG)
+
+## create FileHandler which logs debug messages
+#fh = logging.FileHandler('main_bt.log')
+#fh.setLevel(logging.INFO)
+
+## create console handler with a higher log level
+#ch = logging.StreamHandler()
+#ch.setLevel(logging.INFO)
+
+## create formatter and add it to the handlers
+#formatter = logging.Formatter('%asctime)s - %(name)s - %(levelname)s - %(message)s')
+#fh.setFormatter(formatter)
+#ch.setFormatter(formatter)
+
+## add the handlers to the logger
+#logger.addHandler(fh)
+#logger.addHandler(ch)
+
+#logging.basicConfig(filename="bittorrent.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
+#logging.captureWarnings(capture=True)
 
 class TorrentWrapper(object):
     """
@@ -20,6 +40,8 @@ class TorrentWrapper(object):
     the first 6 of the 11 pieces are for file 1. The next 5 pieces are for file 2.
     """
     def __init__(self, metafile):
+        self.logger = logging.getLogger('main_bt.torrent_wrapper.TorrentWrapper')
+        self.logger.info('creating a TorrentWrapper instance')
         with open(metafile, 'rb') as f:
             self.torrent = bdecode(f)
 
