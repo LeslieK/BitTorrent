@@ -1364,7 +1364,9 @@ class Client(object):
             # client writes Not Interested to peer
             self.bt_state[address].interested = 0  # client not interested in peer
             if self.channel_state[address].state == 8:
-                self.channel_state[address].state = 9 # client writes Not Interested
+                self.channel_state[address].state = 9
+            elif self.channel_state[address].state == 5:
+                self.channel_state[address].state = 3
         elif ident == 4:
             # client writes Have to peer
             pass # client writes Have to peer
