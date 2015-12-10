@@ -1,6 +1,6 @@
 ﻿"""
 Leslie B. Klein
-Dec. 1, 2015
+Dec. 10, 2015
 
 This module is a BitTorrent client without extensions.
 It uploads pieces while it downloads pieces.
@@ -151,11 +151,11 @@ class Client(object):
         # store server state:
         # choked/not-choked by leecher
         # interested/not-interested in leecher
-        self.server_bt_state = {} # {address: BTState(choked=0, interested=0)}
+        self.server_bt_state = {} # {address: BTState(choked=1, interested=0)}
         self.closed_leechers_cnt = 0
 
 
-        # used to read files from disk to cache to pbuffer
+        # used to read files from disk to cache (aka pbuffer.buffer)
         self._cache = array.array('B')
         self.output_fds = None # list of file descriptors for writing pieces
 
@@ -420,6 +420,7 @@ class Client(object):
         del self.leecher_conn[address]
         # close reader, writer
         peer.reader.set_exception(None)
+        peer.writer.write(b'')
         peer.writer.close()
         self.closed_leechers_cnt += 1
 
@@ -443,22 +444,105 @@ class Client(object):
         self.logger.info('{}: cleaned up after closing connection'.format(address))
         return True
 
-    def _open_peer_connection(self, peer, reader, writer):
+    @asyncio.coroutine
+    def _open_peer_connection(self, peer):
         """
         sets channel_state[address]
-        attaches reader, writer to peer object
+        writes handshake msg
+        reads handshake msg
+        moves state machine to state 2
+        throws ProtocolError
         """
+        self.logger.info('in _open_peer_connection...')
         address = peer.address
-
         self.logger.info('_open_peer_connection to {}'.format(address))      
 
-        peer.reader = reader
-        peer.writer = writer
+        #peer.reader = reader
+        #peer.writer = writer
         peer.writer.write(self.HANDSHAKE)
         self.channel_state[address].open = 1
         self.channel_state[address].state = 1
         self.logger.info('write Handshake to {}'.format(address))
         self.reset_keepalive(peer)
+
+        # expect handshake msg
+        try:
+            msg = yield from peer.reader.readexactly(68)      # read handshake msg
+        except (TimeoutError, OSError) as e:
+            self.logger.error('{} ConnectionError'.format(address))
+            raise ProtocolError from e
+        except Exception as e:
+            self.logger.error('{} Other Exception'.format(address))
+            raise
+        
+        # check for handshake
+        try:
+            ident = self.check_handshake_msg(peer, bytearray(msg))
+            if ident == HANDSHAKE_ID: # ident is False or HANDSHAKE_ID
+                if self.channel_state[address].state == 1:
+                        self.channel_state[address].state = 2
+                # update peer time (last time self received a msg from peer)
+                peer.timer = datetime.datetime.utcnow()
+                self.logger.info('successfully read Handshake from {}'.format(address))
+                return ident
+        except ProtocolError as e:
+            self.logger.error('did not receive Handshake msg from {}'.format(address, e.args))
+            raise
+
+    @asyncio.coroutine
+    def _open_leecher_connection(self, peer):
+        """
+        sets leecher_conn[address]
+        sets server_bt_state[address]
+
+        reads handshake
+        writes handshake + bitfield
+        moves state machine to state 2
+
+        throws ProtocolError, Exception
+        """
+        address = peer.address
+        self.logger.info('_open_leecher_connection: accepted conn from {}'.format(address))
+
+        # expect handshake
+        try:
+            msg = yield from peer.reader.readexactly(68)
+        except (TimeoutError, OSError) as e:
+            self.logger.error('_open_leecher_connection: {} ConnectionError'.format(address))
+            raise ProtocolError from e
+        except Exception as e:
+            self.logger.error('_open_leecher_connection: {} Other Exception'.format(address))
+            raise
+
+        # check handshake
+        ident = self.check_handshake_msg(peer, bytearray(msg))
+        if ident == HANDSHAKE_ID: # ident is False or HANDSHAKE_ID
+            # add peer to data structures
+            self.leecher_conn[address] = peer  # add leecher to leechers
+            peer.leecher_state = 1  # conn is open
+            # initial bt_state of server
+            self.server_bt_state[address] = BTState(choked=1, interested=0) 
+            # update peer time (last time self received a msg from peer)
+            peer.timer = datetime.datetime.utcnow()
+            self.logger.info('successfully read Handshake from {}'.format(address))
+        else:
+            self.logger.error('did not receive Handshake msg from {}'.format(address, e.args))
+            raise ProtocolError
+
+        # write handshake msg and bitfield msg
+        # first write handshake
+        peer.writer.write(self.HANDSHAKE)
+        if self.leecher_conn[address].leecher_state == 1:
+            self.leecher_conn[address].leecher_state = 10
+        # then write bitfield msg
+        msg = self.make_bitfield_msg()
+        peer.writer.write(msg)
+        if self.leecher_conn[address].leecher_state == 10:
+            self.leecher_conn[address].leecher_state = 2
+        # update client timer (last time self wrote to peer)
+        self.reset_keepalive(peer)
+        self.logger.info('wrote Handshake and Bitfield to {}'.format(address))
+
 
     def _length_of_last_piece(self):
         return self.total_files_length - self.piece_length * (self.torrent.number_pieces - 1)
@@ -818,6 +902,7 @@ class Client(object):
             send interested to peer (if choked by peer)
             send request msg to peer
         """
+        self.logger.info('rcv_piece_msg...')
         msgd = self._parse_piece_msg(buf)
         length = msgd['length']
         ident = msgd['ident']
@@ -826,7 +911,7 @@ class Client(object):
         block = msgd['block']
 
         if self.is_block_received(index, begin):
-            self.logger.info('rcv_piece_msg: received duplicate block index {} begin: {}'\
+            self.logger.info('received duplicate block index {} begin: {}'\
                 .format(index, begin))
             return 'already have block'
         try:
@@ -857,7 +942,7 @@ class Client(object):
 
         elif result == 'bad hash':
             # all blocks received and hash doesn't verify
-            logging.debug('rcv_piece_msg: bad hash index: {}'.format(index))
+            self.logger.info('bad hash index: {}'.format(index))
             self.pbuffer.reset(index)
             
         elif result == 'not done':
@@ -1007,6 +1092,7 @@ class Client(object):
         """
         this is not a coroutine, so I am not using yield from with writer
         """
+        self.logger.info('in send_have_msg...')
         msg = self.make_have_msg(piece_index)
         for addressx, peerx in self.open_peers().items():
             if not peerx.has_piece(piece_index):
@@ -1016,7 +1102,7 @@ class Client(object):
                     self.logger.error('rcv_piece_msg::done error \
                     in writing Have to {}'.format(addressx))
                     raise e
-                self.logging.debug('rcv_piece_msg::done successfully wrote Have msg to {}'.format(addressx))
+                self.logger.info('done successfully wrote Have msg to {}'.format(addressx))
             else:
                 # peer already has piece
                 pass
@@ -1040,6 +1126,7 @@ class Client(object):
         buf: bytearray(msg)
         returns False or HANDSHAKE_ID
         """
+        self.logger.info('in check_handshake_msg...')
         try:
             assert buf[1:20].decode() == 'BitTorrent protocol'
         except UnicodeDecodeError as e:
@@ -1050,24 +1137,22 @@ class Client(object):
             try:
                 assert buf[0] == 19
             except AssertionError as e:
-                self.logger.error("check_handshake_msg: received handshake\
-                msg with length {}; should be 19".format(buf[0].decode()))
+                self.logger.error("received handshake msg with length {}; \
+                should be 19".format(buf[0].decode()))
 
-                raise ProtocolError("check_handshake_msg: \
-                received handshake msg with length {}; should be 19"\
-                    .format(buf[0].decode()))
+                raise ProtocolError("received handshake msg with length {}; \
+                should be 19".format(buf[0].decode()))
             #  handshake message
             msgd = self._parse_handshake_msg(buf)
             try:
                 # check info_hash
                 assert msgd['info_hash'] == self.torrent.INFO_HASH
             except AssertionError as e:
-                self.logger.error("check_handshake_msg: peer is not part of torrent:\
+                self.logger.error("peer is not part of torrent: \
                 expected hash: {}".format(self.torrent.INFO_HASH))
 
-                raise ProtocolError("check_handshake_msg: \
-                peer is not part of torrent: expected hash: {}"\
-                    .format(self.torrent.INFO_HASH))
+                raise ProtocolError("peer is not part of torrent: \
+                expected hash: {}".format(self.torrent.INFO_HASH))
 
             # Note: check peer_id
             # check that peer.peer_id from tracker_response['peers'] (dictionary model)
@@ -1126,22 +1211,13 @@ class Client(object):
         msg: bittorrent msg
         throws ProtocolError, BufferFullError
         """
+
+        self.logger.info('in process_read_msg...')
         if not msg:
             return
 
         buf = bytearray(msg)
         address = peer.address
-        
-        # check for handshake
-        try:
-            ident = self.check_handshake_msg(peer, buf)
-        except ProtocolError as e:
-            self.logger.error('process_read_msg: received Handshake msg with errors')
-            raise e
-        if ident == HANDSHAKE_ID: # ident is False or HANDSHAKE_ID
-            if self.channel_state[address].state == 1:
-                self.channel_state[address].state = 2
-            return ident
 
         ident = buf[4]
 
@@ -1224,7 +1300,7 @@ class Client(object):
             try: 
                 assert length == 1
             except AssertionError:
-                raise ProtocolError("Not Interested: bad length  received: {} expected: 1"\
+                raise ProtocolError("Not Interested: bad length received: {} expected: 1"\
                                         .format(length))
             peer.timer = datetime.datetime.utcnow()
             peer.bt_state.interested = 0  # peer is not interested in client
@@ -1237,7 +1313,7 @@ class Client(object):
         elif ident == 4:
             #  have message
             try:
-                assert self.channel_state[iaddress].state != 1
+                assert self.channel_state[address].state != 1
             except AssertionError:
                 raise ProtocolError("cannot receive Have msg in state 1")
             peer.timer = datetime.datetime.utcnow()
@@ -1304,8 +1380,7 @@ class Client(object):
                 elif result == 'already have block':
                     # piece msg is a duplicate: go to state 6
                     self.channel_state[address].state = 6
-                    print('process_read_msg: duplicate block')
-                    logging.debug('process_read_msg: duplicate block')
+                    self.logger.info('duplicate block')
         elif ident == 8:
             #  cancel message
             peer.timer = datetime.datetime.utcnow()
@@ -1318,10 +1393,20 @@ class Client(object):
             peer.timer = datetime.datetime.utcnow()
             self.logger.info('extensions not supported')
             ident = NOTSUPPORTED_ID
+        elif self.check_handshake_msg(peer, buf) == HANDSHAKE_ID:
+                # received handshake msg
+                self.logger.error('process_server_read: \
+                handshake msg unexpectedly received from {}'.format(address))
+                raise ProtocolError
         else:
             # error
             self.logger.info("unknown bt message; received id: {}".format(ident))
             raise ProtocolError
+
+        # update peer time (last time self received a msg from peer)
+        peer.timer = datetime.datetime.utcnow()
+        self.logger.info('client successfully read {} from {}'\
+            .format(bt_messages[ident], address))  
         return ident
 
     def process_write_msg(self, peer, ident):
@@ -1345,6 +1430,7 @@ class Client(object):
         have
         piece
         """
+        self.logger.info('in process_write_msg...')
         address = peer.address
         self.reset_keepalive(peer)
         if ident == 2:
@@ -1471,8 +1557,7 @@ class Client(object):
                 self.leecher_conn[address].leecher_state = 6
 
             # peer requests block from server
-            if peer.bt_state.interested and not peer.bt_state.choked and \
-                not self.server_bt_state[address].choked:
+            if peer.bt_state.interested and not peer.bt_state.choked:
                 # send piece msg
                 try:
                     piece_msg = yield from self.send_piece_msg(peer, msgd) # server sends piece message
@@ -1544,7 +1629,6 @@ class Client(object):
 
         read Handshake, write Handshake+bitfield
         """
-        #print('in handle_leecher...')
         self.logger.info('in handle_leecher...')
 
         # get peer address
@@ -1555,43 +1639,20 @@ class Client(object):
 
         self.logger.info('in handle_leecher peername: {}'.format(address))
 
-        # expect Handshake
         try:
-            msg = yield from reader.readexactly(68)
-        except Exception("error in waiting for handshake from {}".format(address)) as e:
-            self.logger.info('handle_leecher: {}'.format(e.args))
-            self._close_leecher_connection(peer)
-        try:
-            buf = bytearray(msg)
-            msg_ident = self.check_handshake_msg(peer, buf)
-        except ProtocolError("error in handshake recvd from {}".format(address)) as e:
-            self.logger.error('handler_leecher: ProtocolError: Received Handshake msg \
+            yield from self._open_leecher_connection(peer)
+        except ProtocolError:
+            self.logger.error('ProtocolError: Received Handshake msg \
             with errors from {} {}'.format(address, e.args))
-            self._close_leecher_connection(peer)
-        except Exception("other exception reading handshake from {}".format(address)) as e:
-            self.logger.error('handler_leecher: Other Exception reading Handshake msg \
-            from {} {}'.format(address, e.args))
-            self._close_leecher_connection(peer)
-
-        # process handshake msg
-        peer.timer = datetime.datetime.utcnow()
-        peer.leecher_state = 1  # conn is open
-        self.leecher_conn[address] = peer  # add leecher to leechers
-        # leecher does not choke server and server is not interested in leecher
-        self.server_bt_state[address] = BTState(choked=0, interested=0) 
-
-        # write handshake msg and bitfield msg
-        # first write handshake
-        peer.writer.write(self.HANDSHAKE)
-        if self.leecher_conn[address].leecher_state == 1:
-            self.leecher_conn[address].leecher_state = 10
-        # then write bitfield msg
-        msg = self.make_bitfield_msg()
-        peer.writer.write(msg)
-        self.process_server_write(peer, msg)
-        # update client timer
-        peer._client_keepalive_timer = datetime.datetime.utcnow()
-        self.logger.info('handle_leecher: wrote Handshake and Bitfield to {}'.format(address))
+            # close reader, writer
+            peer.reader.set_exception(None)
+            peer.writer.close()
+            self.closed_leechers_cnt += 1
+            peer = None
+            return
+        except Exception as e:
+            self.logger.error('caught Exception')
+            raise
 
         while True:
             # read next msg
@@ -1600,67 +1661,52 @@ class Client(object):
             except Exception as e:
                 self.logger.error(e.args)
                 self._close_leecher_connection(peer)
-                break
+                return
 
     @asyncio.coroutine
     def read_leecher(self, peer):
         """
-        seeder listens to remote peer for a message
-        it then calls process_server_read
+        read msg from peer and process it
+        throws ProtocolError, Exception
         """
         address = peer.address
-        reader = peer.reader
 
         self.logger.info('in read_leecher')
 
-
         try:
-            msg_length = yield from reader.readexactly(4)
+            msg_length = yield from peer.reader.readexactly(4)
         except (TimeoutError, OSError) as e:
-            self.logger.error("read_leecher {}: caught error \
-            from reading msg[0:4]: {}".format(address, e.args))
-            msg_length = None
+            self.logger.error('caught error from reading msg[0:4]: {}'\
+                .format(address, e.args))
+            raise Exception('remote peer forcibly closed connection')
         except Exception as e:
-            self.logger.error("read_leecher {}: Other Exception".format(address, e.args))
-            raise Exception('read_leecher: error in reading msg[0:4]') from e
-        if not msg_length:
-            raise Exception('read_leecher: remote forcibly closed connection')
+            self.logger.error('Other Exception'.format(address, e.args))
+            raise
+            
         if msg_length == KEEPALIVE:
             peer.timer = datetime.datetime.utcnow()
-            self.logger.info('read_leecher: received Keep-Alive from peer {}'.format(address))
+            self.logger.info('received Keep-Alive from peer {}'.format(address))
         else:
             try:
-                msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
+                msg_body = yield from peer.reader.readexactly(self._4bytes_to_int(msg_length))
             except (TimeoutError, OSError) as e:
-                self.logger.error("read_leecher {}: caught error from body {}"\
+                self.logger.error('caught error from body {}'\
                     .format(address, e.args))
-                raise ProtocolError('read_leecher: error in reading msg body \
-                from {}: {}'.format(address, e.args))
+                raise ProtocolError('error in reading msg body from {}: {}'\
+                    .format(address, e.args))
             except Exception as e:
-                self.logger.error("read_leecher {}: caught Other Exception {}".format(address, e.args))
-                raise ProtocolError('read_leecher: caught Other Exception in msg body \
-                from {}: {}'.format(address, e.args))
+                self.logger.error('caught Other Exception {}'.format(address, e.args))
+                raise ProtocolError('caught Other Exception in msg body from {}: {}'\
+                    .format(address, e.args))
             msg_ident = msg_body[0]
-            if msg_ident in list(range(10)):
+            try:
                 # processing the read leecher msg happens here
-                try:
-                    yield from self.process_server_read(peer, msg_length+msg_body)
-                except (ProtocolError, Exception) as e:
-                    self.logger.error('read_leecher: error in process_server_read from {}: {}'.format(address, e.args))
-                    raise ProtocolError from e
-            else:
-                # msg_ident not supported
-                self.logger.info("read_leecher: msg_id {} not supported \
-                leecher state {}".format(msg_ident, self.leecher_conn[address].leecher_state))
-                msg_ident = NOTSUPPORTED_ID
-        self.logger.info('read_leecher: successfully read {} from peer {}'\
-            .format(bt_messages[msg_ident], address))
+                yield from self.process_server_read(peer, msg_length+msg_body)
+            except (ProtocolError, Exception) as e:
+                self.logger.error('read_leecher: error in process_server_read \
+                from {}: {}'.format(address, e.args))
+                raise ProtocolError from e
         return msg_ident
-
-
-
-
-
 
     @asyncio.coroutine
     def close_quiet_connections(self, peer):
@@ -1695,7 +1741,7 @@ class Client(object):
         self.logger.info('connect_to_peer {}'.format(address))
         try:
             reader, writer = yield from asyncio.open_connection(host=ip, port=port)
-        except (TimeoutError, OSError, ConnectionError) as e:
+        except (TimeoutError, OSError) as e:
             self.logger.info("connect_to_peer {}: {}".format(address, e.args))
             self.closed_ips_cnt += 1
             del self.active_peers[address]
@@ -1713,8 +1759,15 @@ class Client(object):
             return
 
         # successful connection to peer
-        # write Handshake
-        self._open_peer_connection(peer, reader, writer)
+        # attach reader, writer to peer
+        peer.reader = reader
+        peer.writer = writer
+        # write Handshake; read Handshake
+        try:
+            yield from self._open_peer_connection(peer)
+        except ProtocolError as e:
+            self.logger.error("handshake failed; closing connection to {}".format(address, e.args))
+            self._close_peer_connection(peer)
 
         self.logger.info('connect_to_peer {}: connection open'.format(address))       
             
@@ -1725,7 +1778,7 @@ class Client(object):
             try:    
                 msg_ident = yield from self.read_peer(peer)
 
-            except (ProtocolError, TimeoutError, OSError, ConnectionError) as e:
+            except (ProtocolError, TimeoutError, OSError) as e:
                 self.logger.error("connect_to_peer: {}: reading bitfield/have {}".format(address, e.args))
                 self._close_peer_connection(peer)
             except Exception as e:
@@ -1925,27 +1978,6 @@ class Client(object):
                 # channel is closed, choked, or all pieces from peers are complete
                 pass
         return
-                            
-                
-    @asyncio.coroutine
-    def _read_handshake(self, peer):
-        address = peer.address
-        # read Handshake from peer
-        self.logger.info('_read_handshake: about to readexactly 68 handshake bytes')
-        
-        try:
-            msg_hs = yield from peer.reader.readexactly(68)      # read handshake msg
-        except (TimeoutError, OSError) as e:
-            self.logger.error('_read_handshake {} ConnectionError'.format(address))
-            raise ProtocolError from e
-        except Exception as e:
-            self.logger.error('_read_handshake {} Other Exception'.format(address))
-            raise
-        # received Handshake from peer
-        msg_ident = yield from self.process_read_msg(peer, msg_hs)
-        self.logger.info('received {} from peer {} channel state: {}'\
-            .format(bt_messages[msg_ident], address, self.channel_state[address].state))
-        return msg_ident
                              
     @asyncio.coroutine
     def read_peer(self, peer):
@@ -1959,63 +1991,40 @@ class Client(object):
 
         self.logger.info('in read_peer')
         
-        if self.channel_state[address].open == 1 and self.channel_state[address].state == 1:
-            self.logger.info('read_peer: to read Handshake from {}'.format(address))
-            try: 
-                msg_ident = yield from self._read_handshake(peer)
+        try:
+            msg_length = yield from reader.readexactly(4)
 
-            except ProtocolError as e:
-                self.logger.error('read_peer {}: read Handshake error {}'.format(address, e.args))
-                raise
-            except Exception as e:
-                self.logger.error('read_peer {}: {}'.format(address, e.args))
-                raise
-
-            self.logger.info('read_peer: successfully read Handshake from {}'.format(address))
-            return msg_ident
+        except (TimeoutError, OSError) as e:
+            self.logger.error('caught error from reading msg_length: {}'.format(address, e.args))
+            raise ProtocolError from e
+        except Exception as e:
+            self.logger.error('caught Other Exception 2:  {}'.format(address, e.args))
+            raise ProtocolError from e
+        if msg_length == KEEPALIVE:
+            peer.timer = datetime.datetime.utcnow()
+            self.logger.info('received Keep-Alive from peer {}'.format(address))
         else:
             try:
-                msg_length = yield from reader.readexactly(4)
+                msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
 
             except (TimeoutError, OSError) as e:
-                self.logger.error("read_peer {}: caught error from reading msg_length: {}".format(address, e.args))
-                raise ProtocolError from e
+                self.logger.error("read_peer {}: caught error from body {}"\
+                    .format(address, e.args))
+                raise protocolError from e
             except Exception as e:
-                self.logger.error("read_peer {}: caught Other Exception 2:  {}".format(address, e.args))
+                self.logger.error("read_peer {}: caught Other Exception {}"\
+                    .format(address, e.args))
                 raise ProtocolError from e
-            if msg_length == KEEPALIVE:
-                peer.timer = datetime.datetime.utcnow()
-                self.logger.info('read_peer: received Keep-Alive from peer {}'.format(address))
-            else:
-                try:
-                    msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
+            msg_ident = msg_body[0]
+            try:
+                # processing the read msg happens here
+                yield from self.process_read_msg(peer, msg_length + msg_body)
+            except (ProtocolError, Exception) as e:
+                self.logger.error('read_peer: error in process_read_msg from {}: {}'.format(address, e.args))
+                raise ProtocolError from e
 
-                except (TimeoutError, OSError) as e:
-                    self.logger.error("read_peer {}: caught error from body {}"\
-                        .format(address, e.args))
-                    raise protocolError from e
-                except Exception as e:
-                    self.logger.error("read_peer {}: caught Other Exception {}"\
-                        .format(address, e.args))
-                    raise ProtocolError from e
-                msg_ident = msg_body[0]
-                if msg_ident in list(range(10)):
-                    try:
-                        # processing the read msg happens here
-                        yield from self.process_read_msg(peer, msg_length + msg_body)
-                    except (ProtocolError, Exception) as e:
-                        self.logger.error('read_peer: error in process_read_msg from {}: {}'.format(address, e.args))
-                        raise ProtocolError from e
-
-                    self.logger.info('read_peer: received {} from peer {} channel state: {}'\
-                        .format(bt_messages[msg_ident], address, \
-                        self.channel_state[address].state))
-                else:
-                    # msg_ident not supported
-                    self.logger.info("read_peer: msg_id {} not supported \
-                    channel state: {}".format(msg_ident, \
-                        self.channel_state[address].state))
-                    msg_ident = NOTSUPPORTED_ID
-            self.logger.info('read_peer: successfully read {} from peer {}'\
-                .format(bt_messages[msg_ident], address))    
-            return msg_ident 
+            self.logger.info('received {} from peer {} channel state: {}'\
+                .format(bt_messages[msg_ident], address, \
+                self.channel_state[address].state))
+                
+        return msg_ident 

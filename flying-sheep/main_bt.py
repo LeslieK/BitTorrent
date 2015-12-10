@@ -67,14 +67,12 @@ def main(client):
 
     if client.seeder:
         # read files from file system into buffer
-        #print('client is a seeder')
         logger.info('client is a seeder')
         try:
             client.read_files_into_buffer()
         except (FileNotFoundError, HashError) as e:
             logger.error(e.args)
             raise KeyboardInterrupt from e
-        #print("finished reading files into buffer...")
         logger.info("finished reading files into buffer...")
 
     if not client.seeder:
