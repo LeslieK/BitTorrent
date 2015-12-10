@@ -137,22 +137,19 @@ def main(client):
                         raise KeyboardInterrupt
                     
         # download complete
-        #print('all pieces downloaded')
         logger.info('all pieces downloaded')
-        if not client.seeder and not hostname:
+        if not hostname:
             client.TRACKER_EVENT='completed'
             client.connect_to_tracker(PORTS[port_index], numwant=0)
+        
+        # leecher sends out Not Interested to all peers
+        # where bt_state[address].interested is True
         client.send_not_interested_to_all()
 
         # copy buffer to filesystem (keep data in buffer)
         # close file descriptors
-        client.write_buffer_to_file() # files are closed after this completes
-        client.seeder = True  # affects shutdown
-
-
-
-
-
+        client.write_buffer_to_file(reset_buffer=False) # files are closed after this completes
+        client.seeder = True
 
 ########################################
 
@@ -182,7 +179,7 @@ if __name__ == "__main__":
         try:
             loop.run_forever()
         except KeyboardInterrupt as e:
-            print(e.args)
+            logger.info('closing server...')
         finally:
             # shutdown server (connection listener)
             server.close()
@@ -192,7 +189,6 @@ if __name__ == "__main__":
         try:
             loop.run_until_complete(main(client))
         except KeyboardInterrupt as e:
-            #print('leecher {}'.format(e.args))
             logger.error('leecher {}'.format(e.args))
         finally:
             client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
