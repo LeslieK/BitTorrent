@@ -452,13 +452,15 @@ class Client(object):
         reads handshake msg
         moves state machine to state 2
         throws ProtocolError
-        """
-        self.logger.info('in _open_peer_connection...')
-        address = peer.address
-        self.logger.info('_open_peer_connection to {}'.format(address))      
 
-        #peer.reader = reader
-        #peer.writer = writer
+        write handshake
+        read handshake
+        write bitfield (if it has pieces)
+        """
+        address = peer.address
+        self.logger.info('in _open_peer_connection to {}'.format(address))      
+
+        # write handshake
         peer.writer.write(self.HANDSHAKE)
         self.channel_state[address].open = 1
         self.channel_state[address].state = 1
@@ -479,15 +481,20 @@ class Client(object):
         try:
             ident = self.check_handshake_msg(peer, bytearray(msg))
             if ident == HANDSHAKE_ID: # ident is False or HANDSHAKE_ID
-                if self.channel_state[address].state == 1:
-                        self.channel_state[address].state = 2
                 # update peer time (last time self received a msg from peer)
                 peer.timer = datetime.datetime.utcnow()
                 self.logger.info('successfully read Handshake from {}'.format(address))
-                return ident
         except ProtocolError as e:
             self.logger.error('did not receive Handshake msg from {}'.format(address, e.args))
             raise
+
+        # write bitfield
+        msg = self.make_bitfield_msg()
+        peer.writer.write(msg)
+        self.channel_state[address].state = 2
+        # update client timer (last time self wrote to peer)
+        self.reset_keepalive(peer)
+        self.logger.info('wrote Handshake and Bitfield to {}'.format(address))
 
     @asyncio.coroutine
     def _open_leecher_connection(self, peer):
@@ -502,16 +509,16 @@ class Client(object):
         throws ProtocolError, Exception
         """
         address = peer.address
-        self.logger.info('_open_leecher_connection: accepted conn from {}'.format(address))
+        self.logger.info('in _open_leecher_connection: accepted conn from {}'.format(address))
 
         # expect handshake
         try:
             msg = yield from peer.reader.readexactly(68)
         except (TimeoutError, OSError) as e:
-            self.logger.error('_open_leecher_connection: {} ConnectionError'.format(address))
+            self.logger.error('{} ConnectionError'.format(address))
             raise ProtocolError from e
         except Exception as e:
-            self.logger.error('_open_leecher_connection: {} Other Exception'.format(address))
+            self.logger.error('{} Other Exception'.format(address))
             raise
 
         # check handshake
@@ -532,13 +539,10 @@ class Client(object):
         # write handshake msg and bitfield msg
         # first write handshake
         peer.writer.write(self.HANDSHAKE)
-        if self.leecher_conn[address].leecher_state == 1:
-            self.leecher_conn[address].leecher_state = 10
         # then write bitfield msg
         msg = self.make_bitfield_msg()
         peer.writer.write(msg)
-        if self.leecher_conn[address].leecher_state == 10:
-            self.leecher_conn[address].leecher_state = 2
+        peer.leecher_state = 10
         # update client timer (last time self wrote to peer)
         self.reset_keepalive(peer)
         self.logger.info('wrote Handshake and Bitfield to {}'.format(address))
@@ -838,6 +842,7 @@ class Client(object):
         update client's representation of the sending peer's bitfield
         peer's bitfield indicates the pieces the peer has 
         """
+        self.logger.info('in rcv_have_msg...')
         address = peer.address
 
         msgd = {}
@@ -847,7 +852,8 @@ class Client(object):
         index = msgd['piece index']
 
         # update data structures
-        self.active_peers[address].has_pieces.add(index)
+        #self.active_peers[address].has_pieces.add(index)
+        peer.has_pieces.add(index)
         self.piece_to_peers[index].add(address)
         if index not in self.pbuffer.completed_pieces:
             self.piece_cnts[index] += 1
@@ -856,19 +862,30 @@ class Client(object):
     def rcv_bitfield_msg(self, peer, buf):
         """
         rcv bitfield from peer
+        check it
         set client's representation of peer's bitfield
+        throws Protocol error
         """
+        self.logger.info('in rcv_bitfield_msg...')
         address = peer.address
 
         msgd = {}
         msgd['length'] = self._4bytes_to_int(buf[:4])
         msgd['id'] = buf[4]
         msgd['bitfield'] = buf[5:]
-        self.active_peers[address].bitfield = msgd['bitfield']
-        self.active_peers[address].has_pieces = self.get_indices(msgd['bitfield'])
+
+        # check bitfield
+        try:
+            self.check_bitfield_msg(msgd)
+        except AssertionError as e:
+            raise ProtocolError from e
+        peer.bitfield = msgd['bitfield']
+        peer.has_pieces = self.get_indices(msgd['bitfield'])
+        #self.active_peers[address].bitfield = msgd['bitfield']
+        #self.active_peers[address].has_pieces = self.get_indices(msgd['bitfield'])
 
         # update data structures
-        for index in self.active_peers[address].has_pieces:
+        for index in peer.has_pieces:
             self.piece_to_peers[index].add(address)
             if index not in self.pbuffer.completed_pieces:
                 self.piece_cnts[index] += 1
@@ -902,7 +919,7 @@ class Client(object):
             send interested to peer (if choked by peer)
             send request msg to peer
         """
-        self.logger.info('rcv_piece_msg...')
+        self.logger.info('in rcv_piece_msg...')
         msgd = self._parse_piece_msg(buf)
         length = msgd['length']
         ident = msgd['ident']
@@ -987,6 +1004,7 @@ class Client(object):
         writes Piece msg to peer
         return Piece msg
         """
+        self.logger.info('in send_piece_msg...')
         index = msgd['index']
         begin = msgd['begin']
         block_length = msgd['block_length']
@@ -995,7 +1013,7 @@ class Client(object):
             peer.writer.write(msg)
             yield from peer.writer.drain()
         except Exception as e:
-            self.logger.error('send_piece_msg: error in writing msg to {} index {} begin {}'\
+            self.logger.error('error in writing msg to {} index {} begin {}'\
                 .format(peer.address, index, begin))
             raise e
         return msg
@@ -1193,13 +1211,15 @@ class Client(object):
     def check_bitfield_msg(self, msgd):
         """
         msgd: dictionary containing values in msg
+        throws AssertionError
         """
+        self.logger.info('in check_bitfield...')
         bitfield = msgd['bitfield']  # bytearray
         number_padding_bits = 8 - self.torrent.number_pieces % 8
         try:
             assert bitfield[-1] >> number_padding_bits << number_padding_bits == bitfield[-1]
         except AssertionError as e:
-            self.logger.error('check_bitfield_msg: bitfield padding bits contain at least one 1 index {}'\
+            self.logger.error('bitfield padding bits contain at least one 1 index {}'\
                 .format(msgd['index']))
             raise e
 
@@ -1329,13 +1349,12 @@ class Client(object):
                     'Bitfield received in state {}. Did not follow Handshake.'\
                         .format(self.channel_state[address].state))
             peer.timer = datetime.datetime.utcnow()
-            msgd = self.rcv_bitfield_msg(peer, buf)  # set peer's bitfield
             try:
-                self.check_bitfield_msg(msgd)
+                msgd = self.rcv_bitfield_msg(peer, buf)  # set peer's bitfield
             except AssertionError:
-                raise ProtocolError(
-                    'Bitfield has at least one 1 in rightmost {} (padding) bits'\
-                        .format(number_padding_bits))
+                self.logger.error('Bitfield has at least one 1 in \
+                rightmost (padding) bits')
+                raise ProtocolError
             self.channel_state[address].state = 4  # peer sends bitfield message
         elif ident == 6:
             #  request message
@@ -1405,8 +1424,8 @@ class Client(object):
 
         # update peer time (last time self received a msg from peer)
         peer.timer = datetime.datetime.utcnow()
-        self.logger.info('client successfully read {} from {}'\
-            .format(bt_messages[ident], address))  
+        self.logger.info('client successfully read {} from {} state: {}'\
+            .format(bt_messages[ident], address, self.channel_state[address].state))  
         return ident
 
     def process_write_msg(self, peer, ident):
@@ -1498,7 +1517,9 @@ class Client(object):
 
         if ident == 0:
             # server reads choke msg
-            self.server_bt_state[address].choked = 1
+            self.server_bt_state[address].choked = 1 # server is choked by peer
+            if peer.leecher_state == 10:
+                peer.leecher_state = 2
         elif ident == 2:
             # server reads Interested msg
             
@@ -1509,8 +1530,10 @@ class Client(object):
                 raise ProtocolError("Interested: bad length received from {}: expected: 1"\
                                         .format(address))
             peer.bt_state.interested = 1  # peer is interested in server
-            if self.leecher_conn[address].leecher_state == 2:
-                self.leecher_conn[address].leecher_state = 4
+            if peer.leecher_state == 2:
+                peer.leecher_state = 4
+            if peer.leecher_state == 10:
+                peer.leecher_state = 4
             # unchoke peer
             if peer.bt_state.choked and self.number_unchoked_peers < MAX_UNCHOKED_PEERS:
                 self.send_unchoke_msg(peer)
@@ -1532,17 +1555,39 @@ class Client(object):
             except AssertionError:
                 raise ProtocolError("Not Interested: bad length received from {} expected: 1"\
                                         .format(address))
-            peer.bt_state.interested = 0  # peer is not interested in client
+            peer.bt_state.interested = 0  # peer is not interested in server
             # send peer Choke msg
             if peer.bt_state.choked == 0: # unchoked
                 self.send_choke_msg(peer)
                 self.process_server_write(peer, CHOKE)
                 peer.bt_state.choked = 1
                 self.number_unchoked_peers -= 1
+            if peer.leecher_state == 10:
+                peer.leecher_state = 2
         elif ident == 4:
             # server reads Have msg from leecher
+            # peer.has_pieces.add(index)
+            # piece_to_peers[index].add(address)
+            # update piece_cnts[index] += 1 (if necessary)
             peer.timer = datetime.datetime.utcnow()
-            # msgd = self.rcv_have_msg(peer, buf)  <------------------------ how to integrate leecher_conn[address].has_pieces and self.active_peers[address].has_pieces ???
+            msgd = self.rcv_have_msg(peer, buf)
+            if peer.leecher_state == 10:
+                peer.leecher_state = 2
+        elif ident == 5:
+            # server reads a bitfield msg
+            # only valid if immediately after handshake sequence
+            try:
+                assert self.leecher_conn[address].leecher_state == 10
+            except AssertionError as e:
+                self.logger.error('bitfield does not follow handshake sequence: {}'.format(address))
+                raise ProtocolError
+            try:
+                # check bitfield
+                msgd = self.rcv_bitfield_msg(peer, buf)
+            except ProtocolError as e:
+                self.logger.error('Bitfield has at least one 1 in rightmost (padding) bits')
+                raise
+            peer.leecher_state = 2
         elif ident == 6:
             # server reads Request msg
             msgd = self._parse_request_msg(buf)
@@ -1553,8 +1598,10 @@ class Client(object):
                 raise ProtocolError('check_request_msg: \
                 received bad request from {}: {}'.format(address, e.args))
 
-            if self.leecher_conn[address].leecher_state == 5:
-                self.leecher_conn[address].leecher_state = 6
+            if peer.leecher_state == 5:
+                peer.leecher_state = 6
+            elif peer.leecher_state == 10:
+                peer.leecher_state = 2
 
             # peer requests block from server
             if peer.bt_state.interested and not peer.bt_state.choked:
@@ -1570,7 +1617,8 @@ class Client(object):
         elif ident == 8:
             # Cancel msg
             # client must cancel associated request
-            pass
+            if peer.leecher_state == 10:
+                peer.leecher_state = 2
         else:
             # check if handshake msg; if yes, close_connection to leecher
             if HANDSHAKE_ID == self.check_handshake_msg(peer, buf):
@@ -1595,27 +1643,27 @@ class Client(object):
 
         if ident == 0:
             # server wrote Choke msg
-            if self.leecher_conn[address].leecher_state == 3:
-                self.leecher_conn[address].leecher_state = 2
-            elif self.leecher_conn[address].leecher_state == 5:
-                self.leecher_conn[address].leecher_state = 4
+            if peer.leecher_state == 3:
+                peer.leecher_state = 2
+            elif peer.leecher_state == 5:
+                peer.leecher_state = 4
         elif ident == 1:
             # server wrote Unchoke msg           
-            if self.leecher_conn[address].leecher_state == 2:
-                self.leecher_conn[address].leecher_state = 3
-            elif self.leecher_conn[address].leecher_state == 4:
-                self.leecher_conn[address].leecher_state = 5
+            if peer.leecher_state == 2:
+                peer.leecher_state = 3
+            elif peer.leecher_state == 4:
+                peer.leecher_state = 5
         elif ident == 4:
             # server wrote Have msg
             pass
-        elif ident == 5:
-            # server wrote Bitfield msg (always follows Handshake)
-            if self.leecher_conn[address].leecher_state == 10:
-                self.leecher_conn[address].leecher_state = 2
+        #elif ident == 5:
+        #    # server wrote Bitfield msg (always follows Handshake)
+        #    if self.leecher_conn[address].leecher_state == 10:
+        #        self.leecher_conn[address].leecher_state = 2
         elif ident == 7:
             # server wrote Piece msg
-            if self.leecher_conn[address].leecher_state == 6:
-                self.leecher_conn[address].leecher_state = 5
+            if peer.leecher_state == 6:
+                peer.leecher_state = 5
         # update client timer (last time self sends msg to peer)
         peer._client_keepalive_timer = datetime.datetime.utcnow()
         self.logger.info('process_server_write: server successfully wrote {} to {}'\
@@ -1738,7 +1786,7 @@ class Client(object):
         address = peer.address
         ip, port = address
 
-        self.logger.info('connect_to_peer {}'.format(address))
+        self.logger.info('in connect_to_peer: {}'.format(address))
         try:
             reader, writer = yield from asyncio.open_connection(host=ip, port=port)
         except (TimeoutError, OSError) as e:
@@ -1769,11 +1817,11 @@ class Client(object):
             self.logger.error("handshake failed; closing connection to {}".format(address, e.args))
             self._close_peer_connection(peer)
 
-        self.logger.info('connect_to_peer {}: connection open'.format(address))       
+        self.logger.info('{}: connection open'.format(address))       
             
         while not peer.has_pieces:
             # no bitfield or have msgs yet
-            self.logger.info('connnect_to_peer {}: while loop: (no bitfield/have)'.format(address))
+            self.logger.info('{}: while loop: (no bitfield/have)'.format(address))
 
             try:    
                 msg_ident = yield from self.read_peer(peer)
@@ -1793,7 +1841,7 @@ class Client(object):
         # interested --> request --> process blocks received --> request -->...
         #
         # select a piece_index and a peer
-
+        self.logger.info('in select piece...')
         try:
             result = self._get_next_piece()
         except ConnectionError as e:
@@ -1806,11 +1854,11 @@ class Client(object):
             # [rindex, {set of rpeers}] assigned to self.selected_index_peers
             return result
         elif result == 'no open connections':
-            self.logger.info('select_piece: no open connections')
+            self.logger.info('no open connections')
             return result # connect to tracker
         elif result == 'need more pieces': # self.piece_cnts has been consumed
             # this should not happen
-            self.logger.info('select_piece: self.piece_cnts have been consumed')
+            self.logger.info('self.piece_cnts have been consumed')
             return result # connect to tracker
 
     @asyncio.coroutine 
@@ -1819,6 +1867,7 @@ class Client(object):
         run through protocol with rpeer
         repeat: write request/read piece - until entire piece is downloaded
         """
+        self.logger.info('in get_piece...')
         address = rpeer.address
 
         while self.channel_state[address].open and rindex not in self.pbuffer.completed_pieces:
@@ -1830,8 +1879,8 @@ class Client(object):
                     rpeer.writer.write(INTERESTED)
                     yield from rpeer.writer.drain()
                 except Exception as e:
-                    self.logger.error('get_piece: {}: error in writing \
-                    Interested'.format(address, e.args))
+                    self.logger.error('{}: error in writing Interested'\
+                        .format(address, e.args))
                     self._close_peer_connection(rpeer)
                 finally:
                     if not self.active_peers:
@@ -1840,7 +1889,7 @@ class Client(object):
 
                 self.process_write_msg(rpeer, bt_messages_by_name['Interested'])
                 
-                self.logger.info("get_piece: {}: wrote INTERESTED state {}".\
+                self.logger.info("{}: wrote INTERESTED state {}".\
                     format(address, self.channel_state[address].state))
             else:
                 # channel is closed or client is already interested
@@ -1849,7 +1898,7 @@ class Client(object):
             # if Choked, Read until Unchoked
             while self.channel_state[address].open and self.bt_state[address].choked:
 
-                self.logger.info("get_piece: {}: client ready to receive Unchoke state {}"\
+                self.logger.info("{}: client ready to receive Unchoke state {}"\
                     .format(address, self.channel_state[address].state))
                 try:
                     msg_ident = yield from self.read_peer(rpeer)  
@@ -1865,7 +1914,7 @@ class Client(object):
                     if not self.active_peers:
                         # close Task so loop stops and program can reconnect to Tracker 
                         return
-                self.logger.info("get_piece: {}: received {} state {}"\
+                self.logger.info("{}: received {} state {}"\
                     .format(address, bt_messages[msg_ident], self.channel_state[address].state))
                 if bt_messages[msg_ident] == 'Unchoke':
                     break
@@ -1987,12 +2036,11 @@ class Client(object):
         throws ProtocolError, Exception
         """
         address = peer.address
-        reader = peer.reader
 
         self.logger.info('in read_peer')
         
         try:
-            msg_length = yield from reader.readexactly(4)
+            msg_length = yield from peer.reader.readexactly(4)
 
         except (TimeoutError, OSError) as e:
             self.logger.error('caught error from reading msg_length: {}'.format(address, e.args))
@@ -2005,14 +2053,14 @@ class Client(object):
             self.logger.info('received Keep-Alive from peer {}'.format(address))
         else:
             try:
-                msg_body = yield from reader.readexactly(self._4bytes_to_int(msg_length))
+                msg_body = yield from peer.reader.readexactly(self._4bytes_to_int(msg_length))
 
             except (TimeoutError, OSError) as e:
-                self.logger.error("read_peer {}: caught error from body {}"\
+                self.logger.error("{}: caught error from body {}"\
                     .format(address, e.args))
                 raise protocolError from e
             except Exception as e:
-                self.logger.error("read_peer {}: caught Other Exception {}"\
+                self.logger.error("{}: caught Other Exception {}"\
                     .format(address, e.args))
                 raise ProtocolError from e
             msg_ident = msg_body[0]
@@ -2022,9 +2070,5 @@ class Client(object):
             except (ProtocolError, Exception) as e:
                 self.logger.error('read_peer: error in process_read_msg from {}: {}'.format(address, e.args))
                 raise ProtocolError from e
-
-            self.logger.info('received {} from peer {} channel state: {}'\
-                .format(bt_messages[msg_ident], address, \
-                self.channel_state[address].state))
                 
         return msg_ident 
