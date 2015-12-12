@@ -1196,10 +1196,13 @@ class Client(object):
 
             return HANDSHAKE_ID
 
-    def check_request_msg(self, msgd):
+    def check_request_msg(self, buf):
         """
+        buf: bytearray(msg) where msg is b'...'
         msgd: dictionary containing values in msg
+        throws ProtocolError, Exception
         """
+        msgd = self._parse_request_msg(buf)
         length = msgd['length']
         ident = msgd['id']
         index = msgd['index']
@@ -1219,6 +1222,7 @@ class Client(object):
             exceeds piece length index {}'.format(index))
         except Exception as e:
             self.logger.error(e.args)
+        return msgd
 
     def check_bitfield_msg(self, msgd):
         """
@@ -1343,16 +1347,16 @@ class Client(object):
                 self.number_unchoked_peers -= 1
                 self.process_write_msg(peer, bt_messages_by_name['Choke'])
         elif ident == 4:
-            #  have message
+            #  read have message
             msgd = self.rcv_have_msg(peer, buf)
             if self.channel_state[address].state == 2:
-                self.channel_state[address].state = 3
+                self.channel_state[address].state = 4
             elif self.channel_state[address].state == 20:
                 self.channel_state[address].state = 4
             elif self.channel_state[address].state == 21:
                 self.channel_state[address].state = 50
             elif self.channel_state[address].state == 22:
-                self.channel_state[address].state = 3
+                self.channel_state[address].state = 4
         elif ident == 5:
             #  bitfield message
             try:
@@ -1370,10 +1374,9 @@ class Client(object):
             self.channel_state[address].state = 4  # peer sends bitfield message
         elif ident == 6:
             #  request message
-            msgd = self._parse_request_msg(buf)
             # check request message
             try:
-                self.check_request_msg(msgd)
+                msgd = self.check_request_msg(buf)
             except Exception as e:
                 raise ProtocolError('check_request_msg: {}'.format(e.args)) from e
              
@@ -1489,7 +1492,8 @@ class Client(object):
                 self.channel_state[address].state = 50
         elif ident == 4:
             # client writes Have to peer
-            pass # client writes Have to peer
+            if self.channel_state[address].state == 2:
+                self.channel_state[address].state = 3
         elif ident == 6:
             # client writes Request to peer
             if self.channel_state[address].state == 6:
@@ -1534,7 +1538,12 @@ class Client(object):
             # server reads choke msg
             self.server_bt_state[address].choked = 1 # server is choked by peer
             if self.server_channel_state[address] in [2, 20]:
-                self.server_channel_state[address] = 3
+                self.server_channel_state[address] = 4
+        elif ident == 1:
+            # server reads unchoke msg
+            self.server_bt_state[address].choked = 0 # server is unchoked by peer
+            if self.server_channel_state[address] in [2, 20]:
+                self.server_channel_state[address] = 4
         elif ident == 2:
             # server reads Interested msg
             
@@ -1546,7 +1555,7 @@ class Client(object):
                                         .format(address))
             peer.bt_state.interested = 1  # peer is interested in server
             if self.server_channel_state[address] in [2, 20]:
-                self.server_channel_state[address] = 3
+                self.server_channel_state[address] = 4
             # unchoke peer
             if peer.bt_state.choked and self.number_unchoked_peers < MAX_UNCHOKED_PEERS:
                 self.send_unchoke_msg(peer)
@@ -1576,7 +1585,7 @@ class Client(object):
                 peer.bt_state.choked = 1
                 self.number_unchoked_peers -= 1
             if self.server_channel_state[address] in [2, 20]:
-                self.server_channel_state[address] = 3
+                self.server_channel_state[address] = 4
         elif ident == 4:
             # server reads Have msg from leecher
             # peer.has_pieces.add(index)
@@ -1584,12 +1593,12 @@ class Client(object):
             # update piece_cnts[index] += 1 (if necessary)
             msgd = self.rcv_have_msg(peer, buf)
             if self.server_channel_state[address] in [2, 20]:
-                self.server_channel_state[address] = 3
+                self.server_channel_state[address] = 4
         elif ident == 5:
             # server reads a bitfield msg
             # only valid if immediately after handshake sequence
             try:
-                assert self.server_channel_state[address] == 2
+                assert self.server_channel_state[address] in [2, 20]
             except AssertionError as e:
                 self.logger.error('bitfield does not immed follow handshake \
                 sequence: {}'.format(address))
@@ -1600,19 +1609,19 @@ class Client(object):
             except ProtocolError as e:
                 self.logger.error('Bitfield has at least one 1 in rightmost (padding) bits')
                 raise
-            self.server_channel_state[address] = 20
+            self.server_channel_state[address] = 4
         elif ident == 6:
             # server reads Request msg
-            msgd = self._parse_request_msg(buf)
+
             # check request message
             try:
-                self.check_request_msg(msgd)
+                msgd = self.check_request_msg(buf)
             except Exception as e:
                 raise ProtocolError('check_request_msg: \
                 received bad request from {}: {}'.format(address, e.args))
 
             if self.server_channel_state[address] in [2, 20]:
-                self.server_channel_state[address] = 3
+                self.server_channel_state[address] = 4
 
             # peer requests block from server
             if peer.bt_state.interested and not peer.bt_state.choked:
@@ -1625,6 +1634,17 @@ class Client(object):
                         .format(bt_messages[ident], address))
                 peer.num_bytes_downloaded += msgd['length']
                 self.process_server_write(peer, piece_msg)
+        elif ident == 7:
+            # server receives a Piece msg
+            try:
+                result = self.rcv_piece_msg(msg)
+            except BufferFullError as e:
+                self.logger.error('BufferFullError: {}'.format(address))
+                raise e
+            except Exception as e:
+                self.logger.error('{}'.format(e.args))
+                raise e
+            self.logger.info('ident == 7; received piece msg; result={}'.format(result))
         elif ident == 8:
             # Cancel msg
             # client must cancel associated request
