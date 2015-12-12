@@ -1,6 +1,6 @@
 ﻿"""
 Leslie B. Klein
-Date: 12/6/2015
+Date: 12/11/2015
 
 This main module runs a bittorent leecher or bittorrent seeder (aka server).
 if client.seeder == True: server runs else leecher runs.
@@ -83,6 +83,7 @@ def main(client):
                 if client.USE_TRACKER:
                     # connect to tracker
                     success = client.connect_to_tracker(PORTS[port_index])  # blocking
+                    port_index = (port_index + 1) % len(PORTS)
                 else:
                     # connect directly to a peer (no tracker)
                     logger.info('leecher will connect directly to {}:{}'.format(hostname, port))
@@ -98,7 +99,7 @@ def main(client):
                 port_index = (port_index + 1) % len(PORTS)
                 success = False
             
-            port_index = (port_index + 1) % len(PORTS)  
+            #port_index = (port_index + 1) % len(PORTS)  
         
             if success:
                 tasks_connect = [client.connect_to_peer(peer) \
