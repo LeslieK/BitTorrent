@@ -1,5 +1,10 @@
 """
 This module runs in a 'logging process' that serializes the log messages from the other processes.
+In arguments.py, the default value for hostname cannot be the empty string if you want the leechers 
+to talk to a seeder process (rather than a tracker).
+
+if hostname, client.USE_TRACKER is set to False.
+if not hostname, client.USE_TRACKER is True.
 """
 
 import logging
@@ -76,6 +81,19 @@ def worker_process(queue, configurer, localserverport, seeder=False, \
 
 
 def main_log():
+    """
+    This function sets up the following network:
+
+    seeder: runs a server on (hostname, localserverport=16329)
+
+    leecher_16350: runs a server on (hostname, localserverport=16350) and 
+    connects to seeder (hostname, remoteserverport=16329)
+
+    leecher_16351: connects to leecher_16350 by connecting to (hostname, remoteserverport=16350)
+
+    leecher_16350 is in the middle of the sandwich. It concurrently downloads 
+    from seeder and uploads to leecher_16351.
+    """
     queue = multiprocessing.Queue(-1)
     listener = multiprocessing.Process(target=listener_process, args=(queue, listener_configurer))
     listener.start()
