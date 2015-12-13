@@ -33,7 +33,8 @@ import sys
 from bt_utils import PORTS, HashError
 from client import Client
 from torrent_wrapper import TorrentWrapper
-from arguments import torrent_file, seeder, hostname, port
+from arguments import torrent_file, seeder, hostname
+from arguments import remoteserverport, localserverport
 
 # create logger for main_bt
 logger = logging.getLogger('main_bt')
@@ -56,11 +57,12 @@ ch.setFormatter(formatter)
 logger.addHandler(fh)
 logger.addHandler(ch)
 
-#logging.basicConfig(filename="bittorrent_seeder.log", filemode='w', level=logging.DEBUG, format='%(asctime)s %(message)s')
-#logging.captureWarnings(capture=True)
 
 @asyncio.coroutine
-def main(client):
+def main(client, port=remoteserverport):
+    """
+    client connects to TRACKER or peer=(hostname, remoteserverport)
+    """
 
     if hostname:
         client.USE_TRACKER = False
@@ -72,7 +74,7 @@ def main(client):
             client.read_files_into_buffer()
         except (FileNotFoundError, HashError) as e:
             logger.error(e.args)
-            raise KeyboardInterrupt from e
+            raise KeyboardInterrupt
         logger.info("finished reading files into buffer...")
 
     if not client.seeder:
@@ -86,7 +88,8 @@ def main(client):
                     port_index = (port_index + 1) % len(PORTS)
                 else:
                     # connect directly to a peer (no tracker)
-                    logger.info('leecher will connect directly to {}:{}'.format(hostname, port))
+                    logger.info('leecher will connect directly to {}:{}'.\
+                        format(hostname, port))
                     list_of_peers = [(hostname, port)]  # remote_peer: (host, port)
                     client._parse_active_peers_for_testing(list_of_peers)
                     success = True
@@ -98,8 +101,6 @@ def main(client):
                 logger.error(e.args)
                 port_index = (port_index + 1) % len(PORTS)
                 success = False
-            
-            #port_index = (port_index + 1) % len(PORTS)  
         
             if success:
                 tasks_connect = [client.connect_to_peer(peer) \
@@ -107,7 +108,7 @@ def main(client):
                 tasks_keep_alive = [client.send_keepalive(peer) \
                     for peer in client.active_peers.values() if peer] # a list of coros
                 #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
-                #    for peer in client.active_peers.values()]
+                #    for peer in client.active_peers.values()] # a list of coros
                 try:
                     yield from asyncio.wait(tasks_connect+tasks_keep_alive)
                 except Exception as e:
@@ -147,8 +148,8 @@ def main(client):
 
         # copy buffer to filesystem (keep data in buffer)
         # close file descriptors
-        client.write_buffer_to_file(reset_buffer=False) # files are closed after this completes
-        client.seeder = True
+        #client.write_buffer_to_file(reset_buffer=False) # files are closed after this completes
+
 
 ########################################
 
@@ -164,31 +165,54 @@ if __name__ == "__main__":
     # create client
     client = Client(TorrentWrapper(torrent_file), seeder=seeder)
 
-    if seeder:
-        # schedule client
-        loop.create_task(main(client))
+    # schedule client
+    loop.create_task(main(client, remoteserverport))
 
-        # create and schedule server
-        server_coro = asyncio.start_server(client.handle_leecher, host='127.0.0.1', port=port, loop=loop)
-        server = loop.run_until_complete(server_coro) # schedule it
-        logger.info('seeder is running on {}:{}'.format(hostname, port))
+    # create and schedule server
+    # server runs on (hostname, localserverport)
+    port=localserverport
+    server_coro = asyncio.start_server(client.handle_leecher, host='127.0.0.1', port=port)
+    #server = loop.run_until_complete(server_coro) # schedule it
+    server = loop.create_task(server_coro) # schedule it
+    logger.info('server is running on {}:{}'.format(hostname, port))
 
 
-    if seeder:
-        try:
-            loop.run_forever()
-        except KeyboardInterrupt as e:
-            logger.info('closing server...')
-        finally:
-            # shutdown server (connection listener)
-            server.close()
-            loop.run_until_complete(server.wait_closed())
-            loop.close()
-    else:
-        try:
-            loop.run_until_complete(main(client))
-        except KeyboardInterrupt as e:
-            logger.error('leecher {}'.format(e.args))
-        finally:
-            client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
-            loop.close()
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt as e:
+        logger.info('server connections open: {}'.format(server.sockets))
+        logger.info('closing server...')
+    finally:
+        # shutdown server (connection listener)
+        client.shutdown()
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+        loop.close()
+
+    #if seeder:
+    #    # schedule client
+    #    loop.create_task(main(client))
+
+    #    # create and schedule server
+    #    server_coro = asyncio.start_server(client.handle_leecher, host='127.0.0.1', port=port, loop=loop)
+    #    server = loop.run_until_complete(server_coro) # schedule it
+    #    logger.info('seeder is running on {}:{}'.format(hostname, port))
+
+    #if seeder:
+    #    try:
+    #        loop.run_forever()
+    #    except KeyboardInterrupt as e:
+    #        logger.info('closing server...')
+    #    finally:
+    #        # shutdown server (connection listener)
+    #        server.close()
+    #        loop.run_until_complete(server.wait_closed())
+    #        loop.close()
+    #else:
+    #    try:
+    #        loop.run_until_complete(main(client))
+    #    except KeyboardInterrupt as e:
+    #        logger.error('leecher {}'.format(e.args))
+    #    finally:
+    #        client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
+    #        loop.close()
