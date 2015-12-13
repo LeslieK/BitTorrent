@@ -1,29 +1,33 @@
 ﻿"""
 Leslie B. Klein
-Date: 12/11/2015
+Date: 12/12/2015
 
-This main module runs a bittorent leecher or bittorrent seeder (aka server).
-if client.seeder == True: server runs else leecher runs.
+This main module runs a bittorent client that connects to remote peers and 
+listens for incoming connections from report peers.
+if client.seeder == True: the client is a bittorrent seeder. 
 
-# listens to incoming connections
->> main_bt.py --seeder [-t <file.torrent>]  
 
-# initiates connections; connects to tracker
->> main_bt.py [-t <file.torrent>]           
+# client is a seeder; its server is bound to (hostname, localserverport)
+>> main_bt.py --seeder [-t <file.torrent>]  --hostname='127.0.0.1' --localserverport=16350
 
-# initiates connections; does not connect to tracker
-# connects directly to remote peer (aka seeder, aka server)
->> main_bt.py --hostname='127.0.0.1' [-t <file.torrent>]          
+# client is a leecher 
+# it connects to (hostname, remoteserverport) for downloading
+# it listens on (hostname, localserverport) for uploading
+>> main_bt.py --hostname='127.0.0.1' --remoteserverport=16329 --localserverport=16350 [-t <file.torrent>]           
 
-The leecher does not listen for incoming connections. 
-It only initiates connections to a peer and downloads pieces from it.
+# client connects to tracker (no hostname)
+# client listens on ('127.0.0.1', localserverport) for uploading
+>> main_bt.py --localserverport=16350 [-t <file.torrent>]  
 
-The remote peer (seeder/server) that uploads to this leecher is running main_bt.py in another process.
-The remote peer is listening for a connection and then exercising the coroutine handle_leecher.
-The leecher is running connect_to_peer and get_next_piece code.
+The difference between the upload code and the download code has to do with opening a connection
+and starting up the bittorrent protocol
+uploader: receives a Handshake msg; sends a Handshake msg
+downloader: sends a Handshake msg; receives a Handshake msg
+If the peers at each end of the connection optionally send a bitfield msg, then there are 4 ways to start up the protocol.
+After the start-up sequence, a stream reader and stream writer are attached to each peer object.
+The peers are stored in self.active_peers {address: peer}, where the address key is (hostname, port).
 
-main_bt.py does not run a bittorrent client that initiates connections and 
-listens for incoming connections concurrently. (working on it!)
+The protocol state machine supports concurrent uploading and downloading in a single running program.
 """
 
 import logging
@@ -44,7 +48,7 @@ logger.setLevel(logging.INFO)
 fh = logging.FileHandler(filename='main_bt.log', mode='w')
 fh.setLevel(logging.INFO) # INFO and DEBUG
 
-# create console handler with a higher log level
+# create console handler with a higher log level (or not)
 ch = logging.StreamHandler()
 ch.setLevel(logging.INFO) # INFO and DEBUG
 
@@ -155,8 +159,13 @@ def main(client, port=remoteserverport):
 
 if __name__ == "__main__":
     """
-    This script lets the seeder (aka server) run forever.
-    It lets the leecher run until main() completes, which happens when leecher downloads all pieces.
+    This script creates a bittorrent client and registers it with the event loop.
+    It also creates a server and schedules it with the event loop.
+    The top-level script:
+    -- calls main(client, remoteserverport) to connect the client to 
+    (hostname, remoteserverport) to download pieces.
+    -- creates a listening server on (hostname, localserverport) that calls 
+    client.handle_leecher each time it accepts a connection from some other client.
     """
 
     loop = asyncio.get_event_loop()
@@ -188,31 +197,3 @@ if __name__ == "__main__":
         server.close()
         loop.run_until_complete(server.wait_closed())
         loop.close()
-
-    #if seeder:
-    #    # schedule client
-    #    loop.create_task(main(client))
-
-    #    # create and schedule server
-    #    server_coro = asyncio.start_server(client.handle_leecher, host='127.0.0.1', port=port, loop=loop)
-    #    server = loop.run_until_complete(server_coro) # schedule it
-    #    logger.info('seeder is running on {}:{}'.format(hostname, port))
-
-    #if seeder:
-    #    try:
-    #        loop.run_forever()
-    #    except KeyboardInterrupt as e:
-    #        logger.info('closing server...')
-    #    finally:
-    #        # shutdown server (connection listener)
-    #        server.close()
-    #        loop.run_until_complete(server.wait_closed())
-    #        loop.close()
-    #else:
-    #    try:
-    #        loop.run_until_complete(main(client))
-    #    except KeyboardInterrupt as e:
-    #        logger.error('leecher {}'.format(e.args))
-    #    finally:
-    #        client.shutdown()  # tracker event='stopped' # flush buffer to file system (if necessary)
-    #        loop.close()
