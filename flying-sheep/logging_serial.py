@@ -17,7 +17,7 @@ from arguments import remoteserverport, localserverport, seeder, hostname
 
 def listener_configurer():
     root = logging.getLogger()
-    h = logging.handlers.RotatingFileHandler(filename='bittorrent.log', mode='a', maxBytes=12**20)
+    h = logging.handlers.RotatingFileHandler(filename='bittorrent.log', mode='w', maxBytes=12**20)
     f = logging.Formatter('{asctime} - {processName} - {name} - {message}', style='{')
     h.setFormatter(f)
     root.addHandler(h)
