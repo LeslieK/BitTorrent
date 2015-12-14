@@ -248,13 +248,10 @@ class Client(object):
             self.logger.info('closed all open files...')
 
         # shutdown client
-        #print('client is shutting down...')
         self.logger.info('client is shutting down...')
 
         success = all([self._close_peer_connection(peer) \
-            for address, peer in self.open_peers().items()]) and \
-            all([self._close_leecher_connection(peer) \
-            for address, peer in self.open_leechers().items()])
+            for address, peer in self.open_peers().items()])
 
         if success:
             # successfully closed all open peers and leechers
@@ -270,7 +267,6 @@ class Client(object):
             return True
         else:
             # client did not close all open peers and leechers
-            #print('shutdown: client did not close all open peers/leechers')
             self.logger.info('shutdown: client did not close all open peers/leechers')
             return False
 
