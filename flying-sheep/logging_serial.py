@@ -1,4 +1,4 @@
-"""
+﻿"""
 This module runs in a 'logging process' that serializes the log messages from the other processes.
 In arguments.py, the default value for hostname cannot be the empty string if you want the leechers 
 to talk to a seeder process (rather than a tracker).
@@ -114,4 +114,7 @@ def main_log():
 
 #################### 
 if __name__ == '__main__':
-    main_log()
+    try:
+        main_log()
+    except KeyboardInterrupt:
+        pass
