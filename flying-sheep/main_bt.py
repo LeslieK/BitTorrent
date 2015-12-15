@@ -39,6 +39,7 @@ from client import Client
 from torrent_wrapper import TorrentWrapper
 from arguments import torrent_file, seeder, hostname
 from arguments import remoteserverport, localserverport
+from arguments import remoteserverport1, remoteserverport2
 
 # create logger for main_bt
 logger = logging.getLogger('main_bt')
@@ -63,7 +64,7 @@ logger.addHandler(ch)
 
 
 @asyncio.coroutine
-def main(client, port=remoteserverport):
+def main(client, port=remoteserverport, port1=remoteserverport1, port2=remoteserverport2):
     """
     client connects to TRACKER or peer=(hostname, remoteserverport)
     """
@@ -94,7 +95,9 @@ def main(client, port=remoteserverport):
                     # connect directly to a peer (no tracker)
                     logger.info('leecher will connect directly to {}:{}'.\
                         format(hostname, port))
-                    list_of_peers = [(hostname, port)]  # remote_peer: (host, port)
+                    # remote_peer: (host, port)
+                    # list_of_peers = [(hostname, port), (hostname, port1), (hostname, port2)]  
+                    list_of_peers = [(hostname, rp) for rp in [port, port1, port2] if rp]
                     client._parse_active_peers_for_testing(list_of_peers)
                     success = True
             except KeyboardInterrupt as e:
@@ -120,25 +123,38 @@ def main(client, port=remoteserverport):
                     raise KeyboardInterrupt
 
                 # finished connecting to each peer, now...let's get some pieces
-                while client.open_peers() and not client.all_pieces() and client.piece_cnts:
+                while client.open_peers() and not client.all_pieces():
                     # at least 1 peer is open and 
                     # not all pieces are complete and 
-                    # open peer(s) may have pieces that client needs
+                    if client.piece_cnts:
+                        # open peer(s) have pieces that client needs
+                        # piece_cnts is updated when client receives Have msg
                 
-                    # each task gets blocks for a piece from a distinct peer
-                    result = client.select_piece() # stores [piece, set-of-peers] in attr
-                    if result == 'success':
-                        index, peers = client.selected_piece_peers
-                        tasks_get_piece = [client.get_piece(index, peer) for peer in peers]
+                        # each task gets blocks for a piece from a distinct peer
+                        result = client.select_piece() # stores [piece, set-of-peers] in attr
+                        if result == 'success':
+                            # for 1 piece at a time
+                            #index, peers = client.selected_piece_peers
+                            #tasks_get_piece = [client.get_piece(index, peer) for peer in peers]
+                            # new code to support multiple pieces at a time...
+                            tasks_get_piece = []
+                            peers_assigned_to_a_task = set()
+                            for index, peers in client.selected_piece_peers.items():
+                                # each coro must use a distinct peer
+                                tasks_get_piece += [client.get_piece(index, peer) for peer in peers \
+                                    if peer not in peers_assigned_to_a_task]
+                                peers_assigned_to_a_task = peers_assigned_to_a_task.union(peers)
+                            try:
+                                yield from asyncio.wait(tasks_get_piece+tasks_keep_alive)
+                            except Exception as e:
+                                logger.error(e.args)
+                                raise KeyboardInterrupt
                     else:
-                        # no pieces in open peers
-                        # connect to tracker
-                        break
-                    try:
-                        yield from asyncio.wait(tasks_get_piece+tasks_keep_alive)
-                    except Exception as e:
-                        logger.error(e.args)
-                        raise KeyboardInterrupt
+                        # client.piece_cnts is empty
+                        # client needs to read a Have msg to update client.piece_cnts
+                        # then client can get next piece
+                        logger.info('client waiting for Have msg')
+                        yield from client.wait_for_peers_to_have_pieces()
                     
         # download complete
         logger.info('all pieces downloaded')

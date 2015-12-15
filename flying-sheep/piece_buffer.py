@@ -49,16 +49,12 @@ class PieceBuffer(object):
         ablock = array.array('B', block)
         self.buffer[row][begin:begin+len(ablock)] = ablock
 
-        self.logger.info('insert_bytes: length(ablock) = {}, {}'.format(len(ablock), ablock[:5]))
-        #print('insert_bytes: length(block) = {}, {}'.format(len(ablock), ablock[:5]))
+        self.logger.debug('insert_bytes: length(ablock) = {}, {}'.format(len(ablock), ablock[:5]))
 
-        self.logger.info('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
+        self.logger.debug('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
             .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
-        #print('insert_bytes: PieceBuffer buffer[{}]: {} begin: {}'
-        #    .format(row, self.buffer[row][begin+len(ablock)-5:begin+len(ablock)], begin))
 
         # update bitfield (each bit represents a block in the piece)
-        #self._update_bitfield(piece_index)
         self._update_bitfield(piece_index, begin)
 
         # check if all blocks received
@@ -68,8 +64,7 @@ class PieceBuffer(object):
                 # all bytes received
                 self.piece_info[piece_index]['all_blocks_received'] = True
                 # piece hash matches torrent hash
-                #print('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
-                self.logger.info('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
+                self.logger.debug('all_blocks_received: hash verifies for piece index {}'.format(piece_index))
                 self.piece_info[piece_index]['hash_verifies'] = True
                 self.completed_pieces.add(piece_index)  # set of piece indices
                 return 'done'
@@ -188,14 +183,13 @@ class PieceBuffer(object):
 
         bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
         length = len(bfs)
-        self.logger.info('_update_bitfield (pbuffer): {} block number: {}'\
+        self.logger.debug('_update_bitfield (pbuffer): {} block number: {}'\
             .format(bfs[length-1-block_number], block_number))
-        #print('_update_bitfield (pbuffer): {} block number: {}'\
-        #    .format(bfs[length-1-block_number], block_number))
+        self.logger.info('_update_bitfield (pbuffer): block number: {}'\
+            .format(block_number))
 
         self.piece_info[piece_index]['bitfield'] |= 1 << block_number
 
         bfs = bin(self.piece_info[piece_index]['bitfield'])[3:]
         length = len(bfs)
-        self.logger.info('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
-        #print('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))
+        self.logger.debug('_update_bitfield (pbuffer): {}'.format(bfs[length-1-block_number]))

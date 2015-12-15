@@ -14,10 +14,11 @@ import multiprocessing
 import asyncio
 from main_bt import Client, TorrentWrapper, main, logger
 from arguments import remoteserverport, localserverport, seeder, hostname
+from arguments import remoteserverport1, remoteserverport2
 
 def listener_configurer():
     root = logging.getLogger()
-    h = logging.handlers.RotatingFileHandler(filename='bittorrent.log', mode='w', maxBytes=12**20)
+    h = logging.handlers.RotatingFileHandler(filename='seeder_50_51_52_1piece.log', mode='w', maxBytes=12**20)
     f = logging.Formatter('{asctime} - {processName} - {name} - {message}', style='{')
     h.setFormatter(f)
     root.addHandler(h)
@@ -45,7 +46,7 @@ def worker_configurer(queue):
     root.setLevel(logging.INFO) # send all messages to queue
 
 def worker_process(queue, configurer, localserverport, seeder=False, \
-    remoteserverport=None, hostname='127.0.0.1', torrent_file='Mozart_mininova.torrent'):
+    remoteserverport=None, remoteserverport1=None, remoteserverport2=None, hostname='127.0.0.1', torrent_file='Mozart_mininova.torrent'):
     configurer(queue)
     name = multiprocessing.current_process().name
     print('Worker started: {}'.format(name))
@@ -57,7 +58,7 @@ def worker_process(queue, configurer, localserverport, seeder=False, \
     client = Client(TorrentWrapper(torrent_file), seeder=seeder)
 
     # schedule client
-    loop.create_task(main(client, remoteserverport))
+    loop.create_task(main(client, remoteserverport, remoteserverport1, remoteserverport2))
 
     # create and schedule server
     # server runs on (hostname, localserverport)
@@ -98,13 +99,27 @@ def main_log():
     listener = multiprocessing.Process(target=listener_process, args=(queue, listener_configurer))
     listener.start()
 
+    # args = (---, ---, localserverport, seeder)
     seeder_16329 = multiprocessing.Process(target=worker_process, \
         args=(queue, worker_configurer, 16329, True))
+
+    # args = (---, ---, localserverport, seeder, remoteserverport, remoteserverport1, remoteserverport2)
     leecher_16350 = multiprocessing.Process(target=worker_process, \
         args=(queue, worker_configurer, 16350, False, 16329))
+
     leecher_16351 = multiprocessing.Process(target=worker_process, \
-        args=(queue, worker_configurer, 16351, False, 16350)) 
-    workers = [seeder_16329, leecher_16350, leecher_16351]
+        args=(queue, worker_configurer, 16351, False, 16350))
+    
+    leecher_16352 = multiprocessing.Process(target=worker_process, \
+        args=(queue, worker_configurer, 16352, False, 16350, 16351))
+
+    leecher_16353 = multiprocessing.Process(target=worker_process, \
+        args=(queue, worker_configurer, 16353, False, 16350))
+    
+
+    #workers = [seeder_16329, leecher_16350, leecher_16351] # MAX_PIECES_TO_REQUEST = 1. linear; Good
+    workers = [seeder_16329, leecher_16350, leecher_16351, leecher_16352]
+
     for worker in workers:
         worker.start()
     for worker in workers:

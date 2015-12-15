@@ -17,7 +17,7 @@ DEFAULT_BLOCK_LENGTH = 2**14
 BLOCK_SIZE = DEFAULT_BLOCK_LENGTH
 MAX_BLOCK_SIZE = bytes([4, 0, 0, 0]) # 2**14 == 16384
 MAX_PEERS = 50
-MAX_PEERS_TO_REQUEST_FROM = 1  # used in client._get_next_piece()
+MAX_PIECES_TO_REQUEST = 1  # used in client._get_next_piece(); number of pieces to request at once
 MAX_UNCHOKED_PEERS = 5
 
 NUMWANT = 10  # GET parameter to tracker

@@ -11,10 +11,15 @@ parser.add_argument("-t", "--torrent_file", type=str, default="Mozart_mininova.t
 # default causes leecher to connect to tracker
 parser.add_argument("-n", "--hostname", type=str, default='127.0.0.1',\
     help="ip address of a seeder peer")
-parser.add_argument("-d", "--remoteserverport", type=int, \
+parser.add_argument("--remoteserverport", type=int,\
     help="port number of server on remote host")
-parser.add_argument("-p", "--localserverport", type=int, \
+parser.add_argument("--localserverport", type=int,\
     help="port number of server running on client")
+
+parser.add_argument("--remoteserverport1", type=int, \
+    help="port number of server on remote host")
+parser.add_argument("--remoteserverport2", type=int, \
+    help="port number of server on remote host")
 
 args = parser.parse_args()
 
@@ -23,3 +28,5 @@ seeder = args.seeder
 hostname = args.hostname
 remoteserverport = args.remoteserverport
 localserverport = args.localserverport
+remoteserverport1 = args.remoteserverport1
+remoteserverport2 = args.remoteserverport2
