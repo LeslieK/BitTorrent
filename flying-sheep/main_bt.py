@@ -1,6 +1,6 @@
 ﻿"""
 Leslie B. Klein
-Date: 12/12/2015
+Date: 12/15/2015
 
 This main module runs a bittorent client that connects to remote peers and 
 listens for incoming connections from report peers.
@@ -168,7 +168,7 @@ def main(client, port=remoteserverport, port1=remoteserverport1, port2=remoteser
 
         # copy buffer to filesystem (keep data in buffer)
         # close file descriptors
-        #client.write_buffer_to_file(reset_buffer=False) # files are closed after this completes
+        # client.write_buffer_to_file(reset_buffer=False) # files are closed after this completes
 
 
 ########################################
