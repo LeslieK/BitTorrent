@@ -1586,7 +1586,6 @@ class Client(object):
                 self._close_peer_connection(peer)
                 return
 
-    @asyncio.coroutine
     def close_quiet_connections(self, peer):
         """
         close a connection that has timed out
