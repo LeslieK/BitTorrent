@@ -116,9 +116,9 @@ def main_log():
     leecher_16353 = multiprocessing.Process(target=worker_process, \
         args=(queue, worker_configurer, 16353, False, 16350))
     
-
-    #workers = [seeder_16329, leecher_16350, leecher_16351] # MAX_PIECES_TO_REQUEST = 1. linear; Good
-    workers = [seeder_16329, leecher_16350, leecher_16351, leecher_16352]
+    # tests run
+    # MAX_PIECES_TO_REQUEST = 1; logfile='seeder_50_51_52_1piece.log'
+    workers = [seeder_16329, leecher_16350, leecher_16351, leecher_16352] 
 
     for worker in workers:
         worker.start()
