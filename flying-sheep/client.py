@@ -1594,6 +1594,7 @@ class Client(object):
         """
         if datetime.datetime.utcnow() - peer.timer > CONNECTION_TIMEOUT:
             # close connection
+            self.logger.info('closing quiet connection to {}'.format(peer.address))
             self._close_peer_connection(peer)
     
     @asyncio.coroutine            

@@ -114,10 +114,11 @@ def main(client, port=remoteserverport, port1=remoteserverport1, port2=remoteser
                     for peer in client.active_peers.values() if peer] # a list of coros
                 tasks_keep_alive = [client.send_keepalive(peer) \
                     for peer in client.active_peers.values() if peer] # a list of coros
-                #tasks_close_quite_connections = [client.close_quiet_connections(peer) \
-                #    for peer in client.active_peers.values()] # a list of coros
+                tasks_close_quiet_connections = [client.close_quiet_connections(peer) \
+                    for peer in client.active_peers.values()] # a list of coros
                 try:
-                    yield from asyncio.wait(tasks_connect+tasks_keep_alive)
+                    yield from asyncio.wait(tasks_connect+tasks_keep_alive+\
+                        tasks_close_quiet_connections)
                 except Exception as e:
                     print(e.args)
                     raise KeyboardInterrupt
@@ -145,7 +146,8 @@ def main(client, port=remoteserverport, port1=remoteserverport1, port2=remoteser
                                     if peer not in peers_assigned_to_a_task]
                                 peers_assigned_to_a_task = peers_assigned_to_a_task.union(peers)
                             try:
-                                yield from asyncio.wait(tasks_get_piece+tasks_keep_alive)
+                                yield from asyncio.wait(tasks_get_piece+\
+                                    tasks_keep_alive+tasks_close_quiet_connections)
                             except Exception as e:
                                 logger.error(e.args)
                                 raise KeyboardInterrupt
