@@ -1,11 +1,12 @@
 README.txt
 
-Explains the files:
+The application consists of the following files:
 main_bt.py
 client.py
 piece_buffer.py
 torrent_wrapper.py
 bt_utils.py
+logging_serial.py -- runs a particular network of 4 processes and serializes the log records across all processes
 
 
 bittorent client: this application; it implements the bittorrent protocol
