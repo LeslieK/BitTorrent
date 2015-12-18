@@ -114,6 +114,11 @@ TorrentWrapper is an attribute of the Client.
 -- bt_utils.py:
 helper functions and constants that can be configured
 
+-- logging_serial.py
+>> python logging_serial.py
+Runs 4 instances of the bittorrent application; 1 instance per process
+Each instance writes its log records to a Queue. The Queue serializes log records across all processes.
+Runs an additional process to read the log records from the Queue and write them to a file.
 
 
 
