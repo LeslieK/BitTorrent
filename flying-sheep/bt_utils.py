@@ -26,7 +26,7 @@ HANDSHAKE_ID = 100
 KEEPALIVE_ID = 200
 NOTSUPPORTED_ID = 300
 
-PORTS = [i for i in range(6881, 6890)]
+PORTS = list(range(6881, 6890))
 HANDSHAKE_ID = 100
 KEEPALIVE_ID = 200
 NOTSUPPORTED_ID = 300
@@ -84,7 +84,10 @@ def my_peer_id(size=PEER_ID_SIZE):
     return os.urandom(size)
 
 def make_handshake(info_hash, peer_id):
-    """torrent: a TorrentWrapper object"""
+    """
+    info_hash: self.torrent.INFO_HASH
+    peer_id: client's unique id (from my_peer_id())
+    """
 
     pstrlen = b'\x13'  # 19
     pstr = b'BitTorrent protocol'
@@ -94,19 +97,18 @@ def make_handshake(info_hash, peer_id):
 def rcv_handshake(buf):
     """
     parse handshake msg
-    msg is a bytearray
+    buf: bytearray(msg)
 
     input: complete msg received from peer
     output: msg dict
     """
-    # buf = bytearray(msg)
     msgd = {}
     pstrlen = buf[0]
     if pstrlen != 19:
         raise ValueError('Expected pstrlen is 19. Received pstrlen {}'.format(pstrlen))
     msgd['pstrlen'] = pstrlen
     try:
-        pstr = buf[1:pstrlen + 1].decode()
+        pstr = buf[1:pstrlen + 1].decode('utf-8')
     except UnicodeDecodeError:
         raise ValueError("Expected 'BitTorrent protocol'. Received {}".format(buf[1:pstrlen + 1]))
     else:
@@ -118,10 +120,9 @@ def rcv_handshake(buf):
 
 def number_of_blocks(piece_index, torrent):
     if piece_index != torrent.LAST_PIECE_INDEX:
-        number_of_blocks = math.ceil(torrent.piece_length / BLOCK_SIZE) 
+        return math.ceil(torrent.piece_length / BLOCK_SIZE) 
     else:
-        number_of_blocks = math.ceil(torrent.last_piece_length / BLOCK_SIZE)
-    return number_of_blocks
+        return math.ceil(torrent.last_piece_length / BLOCK_SIZE)
 
 
 

@@ -7,6 +7,7 @@ import logging
 
 from bt_utils import BufferFullError
 from bt_utils import BLOCK_SIZE
+from bt_utils import number_of_blocks
 
 module_logger = logging.getLogger(__name__)
 
@@ -160,16 +161,12 @@ class PieceBuffer(object):
         rightmost bit (LSB): block 0
         """
         try:
-            if piece_index != self.torrent.LAST_PIECE_INDEX:
-                number_of_blocks = math.ceil(self.torrent.piece_length / BLOCK_SIZE) 
-            else:
-                number_of_blocks = math.ceil(self.torrent.last_piece_length / BLOCK_SIZE)
+            num_blocks = number_of_blocks(piece_index, self.torrent)
         except Exception as e:
-            print('pbuffer._init_bitfield: {}'.format(e.args))
             logging.debug('pbuffer._init_bitfield: {}'.format(e.args))
             raise e 
              
-        field = 1 << number_of_blocks
+        field = 1 << num_blocks
         return field
     
     def _update_bitfield(self, piece_index, offset):
